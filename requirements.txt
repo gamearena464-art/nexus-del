@@ -1,8 +1,7 @@
-flask
-gunicorn
-python-telegram-bot>=21.1.0
-groq
-google-genai
-pillow
-requests
-edge-tts
+python-telegram-bot>=21.0,<23.0
+Flask>=3.0,<4.0
+requests>=2.31,<3.0
+groq>=0.9.0
+google-genai>=1.0.0
+edge-tts>=6.1.0
+Pillow>=10.0.0
