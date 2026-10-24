@@ -4,6 +4,7 @@ import io
 import os
 import re
 import urllib.parse
+import threading
 import edge_tts
 from flask import Flask
 from google import genai
@@ -94,23 +95,22 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
     except Exception as e:
         print(f"Fehler: {e}")
 
-# --- STARTBEFEHL FÜR RENDER ---
+# --- BOT DIREKT BEIM LADEN IM HINTERGRUND STARTEN (FÜR GUNICORN) ---
+def run_telegram_bot():
+    if not TELEGRAM_TOKEN:
+        print("FEHLER: TELEGRAM_TOKEN fehlt!")
+        return
+    bot_app = ApplicationBuilder().token(TELEGRAM_TOKEN).build()
+    bot_app.add_handler(CommandHandler("start", start))
+    bot_app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_message))
+    print("Telegram Bot gestartet (Polling)...")
+    bot_app.run_polling()
+
+# Thread starten, egal ob lokal oder via Gunicorn
+bot_thread = threading.Thread(target=run_telegram_bot)
+bot_thread.daemon = True
+bot_thread.start()
+
 if __name__ == "__main__":
-    import threading
-    
-    def run_telegram_bot():
-        if not TELEGRAM_TOKEN:
-            print("FEHLER: TELEGRAM_TOKEN fehlt!")
-            return
-        bot_app = ApplicationBuilder().token(TELEGRAM_TOKEN).build()
-        bot_app.add_handler(CommandHandler("start", start))
-        bot_app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_message))
-        print("Telegram Bot gestartet (Polling)...")
-        bot_app.run_polling()
-
-    t = threading.Thread(target=run_telegram_bot)
-    t.daemon = True
-    t.start()
-
     port = int(os.environ.get("PORT", 10000))
     app.run(host="0.0.0.0", port=port)
