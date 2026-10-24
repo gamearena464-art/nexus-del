@@ -25,7 +25,7 @@ from telegram.ext import (
 
 # ============================================================
 # NEXUS KI-ASSISTENT — Render + Telegram
-# Benötigte Render-Variablen:
+# Render-Variablen:
 # TELEGRAM_TOKEN, GROQ_API_KEY
 # Optional: GROQ_MODEL, WHISPER_MODEL, EDGE_TTS_VOICE,
 # GEMINI_API_KEY, GEMINI_MODEL, DATABASE_PATH
@@ -75,6 +75,7 @@ DATABASE_PATH = os.getenv(
 
 if not TELEGRAM_TOKEN:
     logger.warning("TELEGRAM_TOKEN fehlt.")
+
 if not GROQ_API_KEY:
     logger.warning("GROQ_API_KEY fehlt.")
 
@@ -226,7 +227,9 @@ def log_message(chat_id, role, content):
                 ),
             )
     except Exception:
-        logger.exception("Nachrichtenprotokoll konnte nicht gespeichert werden.")
+        logger.exception(
+            "Nachrichtenprotokoll konnte nicht gespeichert werden."
+        )
 
 
 def learn_from_text(chat_id, text):
@@ -252,6 +255,7 @@ def learn_from_text(chat_id, text):
                     f"Alles klar, ich merke mir: "
                     f"{key} – {value} 😊"
                 )
+
     return None
 
 
@@ -260,12 +264,10 @@ def learn_from_text(chat_id, text):
 # ============================================================
 
 def markdown_to_telegram_html(text):
-    """
-    Wandelt übliche Markdown-Formatierungen in Telegram-HTML um.
-    Erst werden HTML-Sonderzeichen escaped, danach erlaubte
-    Formatierungs-Tags eingesetzt.
-    """
+    """Wandelt übliche Markdown-Formatierungen in Telegram-HTML um."""
     text = (text or "").replace("\r\n", "\n").replace("\r", "\n")
+
+    # HTML-Zeichen schützen.
     text = html.escape(text, quote=False)
 
     # Horizontale Trennlinien entfernen.
@@ -275,14 +277,14 @@ def markdown_to_telegram_html(text):
         text,
     )
 
-    # Überschriften: ## Überschrift wird zu fett formatierter Zeile.
+    # Überschriften formatieren.
     text = re.sub(
         r"(?m)^\s{0,3}#{1,6}\s*(.+?)\s*#*\s*$",
         r"<b>\1</b>",
         text,
     )
 
-    # Codeblöcke vor der normalen Inline-Formatierung behandeln.
+    # Codeblöcke formatieren.
     text = re.sub(
         r"```([a-zA-Z0-9_+-]*)\n?(.*?)```",
         lambda m: "<pre>" + m.group(2) + "</pre>",
@@ -320,7 +322,7 @@ def markdown_to_telegram_html(text):
         text,
     )
 
-    # Listenmarker in lesbare Aufzählungszeichen verwandeln.
+    # Listenmarker ersetzen.
     text = re.sub(
         r"(?m)^\s*[-*]\s+",
         "• ",
@@ -331,10 +333,7 @@ def markdown_to_telegram_html(text):
 
 
 async def send_long_text(message, text, parse_mode=None):
-    """
-    Sendet längere Antworten in mehreren Telegram-Nachrichten.
-    Jede Nachricht wird als Telegram-HTML formatiert.
-    """
+    """Sendet längere Antworten in mehreren Telegram-Nachrichten."""
     text = text or "Entschuldigung, ich habe gerade keine Antwort."
 
     chunks = []
@@ -342,6 +341,7 @@ async def send_long_text(message, text, parse_mode=None):
 
     while len(remaining) > 3500:
         split_at = remaining.rfind("\n", 0, 3500)
+
         if split_at < 1000:
             split_at = 3500
 
@@ -363,7 +363,6 @@ async def send_long_text(message, text, parse_mode=None):
             logger.exception(
                 "Telegram-HTML fehlgeschlagen; sende Klartext."
             )
-            # Sicherer Fallback, falls Telegram HTML ablehnt.
             await message.reply_text(chunk[:4000])
 
 
@@ -399,6 +398,7 @@ def get_ai_reply(chat_id, user_text):
     messages.extend(
         chat_history[str(chat_id)][-MAX_HISTORY_MESSAGES:]
     )
+
     messages.append({
         "role": "user",
         "content": user_text,
@@ -428,6 +428,7 @@ def get_ai_reply(chat_id, user_text):
                 "content": answer[:3000],
             },
         ])
+
         chat_history[str(chat_id)] = history[-MAX_HISTORY_MESSAGES:]
 
         log_message(chat_id, "user", user_text)
@@ -494,6 +495,7 @@ async def remember_command(
 
     if ":" in value:
         possible_key, possible_value = value.split(":", 1)
+
         if possible_key.strip() and possible_value.strip():
             key = possible_key.strip()
             value = possible_value.strip()
@@ -524,6 +526,7 @@ async def memories_command(
     text = "🧠 Das habe ich gespeichert:\n" + "\n".join(
         f"• {key}: {value}" for key, value in memories
     )
+
     await send_long_text(update.effective_message, text)
 
 
@@ -590,9 +593,11 @@ async def image_command(
                 timeout=90,
             )
         )
+
         response.raise_for_status()
 
         content_type = response.headers.get("content-type", "")
+
         if "image" not in content_type:
             raise RuntimeError(
                 "Der Bilddienst hat kein Bild zurückgegeben."
@@ -661,6 +666,7 @@ async def make_voice_file(text, path):
             text[:3000],
             EDGE_TTS_VOICE,
         )
+
         await communicate.save(path)
         return True
 
@@ -769,6 +775,7 @@ async def handle_text(
             or now < group_active_until.get(chat.id, 0)
         ):
             group_active_until.pop(chat.id, None)
+
             await message.reply_text(
                 "Alles klar, ich bin jetzt ruhig. 👋"
             )
@@ -879,6 +886,7 @@ async def handle_voice(
         logger.exception(
             "Verarbeitung der Sprachnachricht fehlgeschlagen."
         )
+
         await message.reply_text(
             "Beim Verarbeiten der Sprachnachricht ist ein Fehler passiert."
         )
@@ -971,6 +979,7 @@ async def handle_photo(
 
     except Exception:
         logger.exception("Fotoanalyse fehlgeschlagen.")
+
         await message.reply_text(
             "Die Fotoanalyse hat gerade nicht funktioniert. "
             "Prüfe GEMINI_API_KEY und GEMINI_MODEL."
@@ -992,26 +1001,24 @@ async def on_error(
     update: object,
     context: ContextTypes.DEFAULT_TYPE,
 ):
-    logger.error(
-        "Telegram-Fehler: %s",
-        context.error,
-        exc_info=context.error,
-    )
-
-
-# ============================================================
-# TELEGRAM-BOT STARTEN
-# ============================================================
-
-def main():
-    init_db()
-
-    if not TELEGRAM_TOKEN:
+    if context.error:
         logger.error(
-            "Bot startet nicht: TELEGRAM_TOKEN fehlt."
+            "Telegram-Fehler:",
+            exc_info=(
+                type(context.error),
+                context.error,
+                context.error.__traceback__,
+            ),
         )
-        return
+    else:
+        logger.error("Telegram-Fehler ohne weitere Details.")
 
+
+# ============================================================
+# TELEGRAM-APPLICATION EINRICHTEN
+# ============================================================
+
+def build_application():
     application = (
         Application.builder()
         .token(TELEGRAM_TOKEN)
@@ -1051,8 +1058,95 @@ def main():
 
     application.add_error_handler(on_error)
 
+    return application
+
+
+# ============================================================
+# TELEGRAM-BOT ASYNCHRON STARTEN
+# ============================================================
+
+async def run_bot_async():
+    """
+    Startet den Telegram-Bot ohne run_polling().
+    Dadurch wird die Signalbehandlung nicht im Hintergrundthread
+    aufgerufen.
+    """
+    application = build_application()
+    updater = application.updater
+
+    if updater is None:
+        raise RuntimeError(
+            "Der Telegram-Updater konnte nicht erstellt werden."
+        )
+
+    initialized = False
+    started = False
+    polling_started = False
+
+    try:
+        logger.info("Initialisiere Telegram-Anwendung …")
+
+        await application.initialize()
+        initialized = True
+
+        await application.start()
+        started = True
+
+        await updater.start_polling(
+            drop_pending_updates=False,
+        )
+        polling_started = True
+
+        logger.info(
+            "NEXUS Telegram-Bot läuft und empfängt Nachrichten."
+        )
+
+        # Den asyncio-Loop am Leben halten.
+        # Telegram verarbeitet Updates im Hintergrund.
+        await asyncio.Event().wait()
+
+    finally:
+        logger.info("Telegram-Bot wird heruntergefahren …")
+
+        if polling_started:
+            try:
+                await updater.stop()
+            except Exception:
+                logger.exception(
+                    "Fehler beim Stoppen des Telegram-Updaters."
+                )
+
+        if started:
+            try:
+                await application.stop()
+            except Exception:
+                logger.exception(
+                    "Fehler beim Stoppen der Telegram-Anwendung."
+                )
+
+        if initialized:
+            try:
+                await application.shutdown()
+            except Exception:
+                logger.exception(
+                    "Fehler beim Herunterfahren der Telegram-Anwendung."
+                )
+
+
+def main():
+    init_db()
+
+    if not TELEGRAM_TOKEN:
+        logger.error(
+            "Bot startet nicht: TELEGRAM_TOKEN fehlt."
+        )
+        return
+
     logger.info("NEXUS Telegram-Bot startet.")
-    application.run_polling(drop_pending_updates=False)
+
+    # asyncio.run() erstellt und verwaltet den Event-Loop
+    # innerhalb des Bot-Threads.
+    asyncio.run(run_bot_async())
 
 
 # ============================================================
@@ -1068,6 +1162,9 @@ def start_bot_thread():
 
     with _bot_lock:
         if _bot_thread and _bot_thread.is_alive():
+            logger.info(
+                "Telegram-Bot-Thread läuft bereits."
+            )
             return
 
         if not TELEGRAM_TOKEN:
@@ -1089,8 +1186,14 @@ def start_bot_thread():
             name="nexus-telegram-bot",
             daemon=True,
         )
-        _bot_thread.start()
 
+        _bot_thread.start()
+        logger.info("Telegram-Bot-Thread wurde gestartet.")
+
+
+# ============================================================
+# ANWENDUNG INITIALISIEREN
+# ============================================================
 
 init_db()
 start_bot_thread()
