@@ -1,4 +1,3 @@
-
 import os
 import re
 import html
@@ -81,30 +80,51 @@ if not GEMINI_API_KEY:
 
 groq_client = Groq(api_key=GROQ_API_KEY) if GROQ_API_KEY else None
 
+# ============================================================
+# KI-PROMPT — PROFESSIONELLE TELEGRAM-ANTWORTEN
+# ============================================================
+
 SYSTEM_PROMPT = """
-Du bist NEXUS, ein freundlicher deutscher KI-Assistent.
+Du bist NEXUS, ein professioneller und freundlicher deutscher KI-Assistent.
 
-Antworte auf Deutsch, klar, freundlich und leicht verständlich.
-Nutze passende Emojis, beispielsweise 😊 ❤️ 👍 ✨ 🤖 🎯.
+SPRACHE UND TON:
+- Antworte auf Deutsch, klar, höflich und verständlich.
+- Bleibe freundlich und natürlich, aber nicht übertrieben verspielt.
+- Verwende wenige, passende Emojis zur Orientierung.
 
-FORMATIERUNG:
-- Verwende kurze, übersichtliche Absätze.
-- Setze Leerzeilen zwischen unterschiedliche Gedanken.
-- Nutze **Fettdruck** für wichtige Begriffe.
-- Nutze *Kursivschrift* sparsam.
-- Nutze __Unterstreichungen__ nur, wenn sinnvoll.
-- Verwende Listen, wenn mehrere Punkte erklärt werden.
-- Überschriften sollen kurz und aussagekräftig sein.
-- Verwende Markdown-Codeblöcke nur bei Code-Anfragen.
-- Bewahre Emojis und Smileys.
-- Schreibe natürlich und nicht übermäßig viele Formatierungszeichen.
+FORMATIERUNG FÜR TELEGRAM:
+- Beginne längere Antworten mit einer aussagekräftigen Überschrift
+  und höchstens 1–2 passenden Emojis.
+- Danach folgt ein kurzer Einleitungsabsatz.
+- Gliedere längere Antworten in klar getrennte Abschnitte.
+- Trenne Abschnitte mit Leerzeilen und halte Absätze kurz.
+- Verwende **Fettdruck** für wichtige Begriffe und Bauteile.
+- Verwende Aufzählungen statt Tabellen.
+- Erstelle niemals Markdown-Tabellen oder Tabellen mit senkrechten
+  Strichen, da Telegram sie oft unübersichtlich darstellt.
+- Vermeide lange Textblöcke und unnötige Wiederholungen.
+- Bei Erklärungen über Gegenstände oder Bauteile verwende nach
+  Möglichkeit dieses Muster:
 
-Erfinde keine Fakten. Wenn du etwas nicht weißt, sage es ehrlich.
-Wenn jemand fragt, wer dich programmiert oder erfunden hat,
-antworte:
-"Der liebe Heiko aus dem Schwabenländle. 😊"
+  **🔧 Name des Bauteils**
 
-Du bist freundlich, geduldig und respektvoll.
+  **Aufgabe:** Erklärung der Funktion.
+
+  **Beispiele:** Nur wenn hilfreich.
+
+- Gib jedem Bauteil einen eigenen Abschnitt.
+- Bei längeren Erklärungen kannst du mit
+  **💡 Gut zu wissen** und einem kurzen Hinweis abschließen.
+- Verwende keine HTML-Tags in deinen Antworten.
+- Nutze Markdown-Codeblöcke nur bei Code-Anfragen.
+- Bewahre wichtige Details, aber erkläre sie übersichtlich.
+
+INHALT:
+- Erfinde keine Fakten. Wenn du etwas nicht weißt, sage es ehrlich.
+- Wenn jemand fragt, wer dich programmiert oder erfunden hat,
+  antworte:
+  "Der liebe Heiko aus dem Schwabenländle. 😊"
+- Sei freundlich, geduldig und respektvoll.
 """.strip()
 
 chat_history = defaultdict(list)
@@ -112,10 +132,10 @@ group_active_until = {}
 MAX_HISTORY_MESSAGES = 12
 GROUP_ACTIVE_SECONDS = 180
 
-
 # ============================================================
 # DATENBANK UND GEDÄCHTNIS
 # ============================================================
+
 
 def db_connect():
     path = Path(DATABASE_PATH)
@@ -257,15 +277,15 @@ def learn_from_text(chat_id, text):
 # MARKDOWN IN TELEGRAM-HTML UMWANDELN
 # ============================================================
 
+
 def markdown_to_telegram_html(text):
-    """Konvertiert gängige Markdown-Formatierung sicher für Telegram."""
+    """Konvertiert Markdown sicher für Telegram und vermeidet Tabellenchaos."""
     text = (text or "").replace("\r\n", "\n").replace("\r", "\n")
 
     # Codeblöcke vor dem HTML-Escaping sichern.
     code_blocks = []
 
     def save_code_block(match):
-        language = match.group(1) or ""
         code = html.escape(match.group(2), quote=False)
         tag = f"<pre>{code}</pre>"
         code_blocks.append(tag)
@@ -278,7 +298,55 @@ def markdown_to_telegram_html(text):
         flags=re.S,
     )
 
-    # Normales HTML schützen, damit Antworten keinen HTML-Fehler auslösen.
+    # Markdown-Tabellen in lesbare Aufzählungen umwandeln.
+    lines = text.split("\n")
+    converted_lines = []
+    i = 0
+
+    while i < len(lines):
+        line = lines[i]
+
+        if (
+            line.count("|") >= 2
+            and i + 1 < len(lines)
+            and re.fullmatch(
+                r"[|\s:-]+",
+                lines[i + 1].strip()
+            )
+            and "-" in lines[i + 1]
+        ):
+            headers = [
+                cell.strip()
+                for cell in line.strip().strip("|").split("|")
+            ]
+            i += 2
+
+            while i < len(lines) and lines[i].count("|") >= 2:
+                cells = [
+                    cell.strip()
+                    for cell in lines[i].strip().strip("|").split("|")
+                ]
+
+                parts = []
+                for index, cell in enumerate(cells):
+                    if not cell:
+                        continue
+                    label = headers[index] if index < len(headers) else ""
+                    parts.append(f"{label}: {cell}" if label else cell)
+
+                if parts:
+                    converted_lines.append("• " + " — ".join(parts))
+
+                i += 1
+
+            continue
+
+        converted_lines.append(line)
+        i += 1
+
+    text = "\n".join(converted_lines)
+
+    # HTML-Sonderzeichen schützen.
     text = html.escape(text, quote=False)
 
     # Horizontale Trennlinien entfernen.
@@ -302,28 +370,28 @@ def markdown_to_telegram_html(text):
         text,
     )
 
-    # Fettdruck innerhalb einer Zeile.
+    # Fettdruck.
     text = re.sub(
         r"\*\*([^\n]+?)\*\*",
         r"<b>\1</b>",
         text,
     )
 
-    # Unterstreichung innerhalb einer Zeile.
+    # Unterstreichung.
     text = re.sub(
         r"__([^\n]+?)__",
         r"<u>\1</u>",
         text,
     )
 
-    # Kursivschrift innerhalb einer Zeile.
+    # Kursivschrift.
     text = re.sub(
         r"(?<!\*)\*([^*\n]+)\*(?!\*)",
         r"<i>\1</i>",
         text,
     )
 
-    # Listenmarker ersetzen.
+    # Aufzählungszeichen.
     text = re.sub(
         r"(?m)^\s*[-*]\s+",
         "• ",
@@ -372,6 +440,7 @@ async def send_long_text(message, text, parse_mode=None):
 # KI-ANTWORTEN
 # ============================================================
 
+
 def get_ai_reply(chat_id, user_text):
     if not groq_client:
         return "Meine KI ist noch nicht verbunden. Bitte prüfe GROQ_API_KEY in Render."
@@ -395,7 +464,7 @@ def get_ai_reply(chat_id, user_text):
             model=GROQ_MODEL,
             messages=messages,
             temperature=0.7,
-            max_tokens=600,
+            max_tokens=1200,
         )
 
         answer = result.choices[0].message.content or "Ich habe gerade keine Antwort."
@@ -419,6 +488,7 @@ def get_ai_reply(chat_id, user_text):
 # ============================================================
 # TELEGRAM-BEFEHLE
 # ============================================================
+
 
 async def start_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.effective_message.reply_text(
@@ -461,7 +531,9 @@ async def remember_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
             value = possible_value.strip()
 
     if save_memory(chat_id, key, value):
-        await update.effective_message.reply_text(f"Gespeichert! 🧠\n{key}: {value}")
+        await update.effective_message.reply_text(
+            f"Gespeichert! 🧠\n{key}: {value}"
+        )
     else:
         await update.effective_message.reply_text(
             "Ich konnte das leider nicht speichern. Prüfe den Datenbankpfad in Render."
@@ -507,6 +579,7 @@ async def forget_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
 # BILDER ERSTELLEN
 # ============================================================
 
+
 async def image_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     prompt = " ".join(context.args).strip()
 
@@ -517,7 +590,9 @@ async def image_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
         )
         return
 
-    await update.effective_message.reply_text("Ich versuche, dein Bild zu erstellen. 🎨")
+    await update.effective_message.reply_text(
+        "Ich versuche, dein Bild zu erstellen. 🎨"
+    )
 
     try:
         url = "https://image.pollinations.ai/prompt/" + requests.utils.quote(prompt)
@@ -560,6 +635,7 @@ async def image_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
 # ============================================================
 # SPRACHNACHRICHTEN
 # ============================================================
+
 
 async def transcribe_voice(file_path):
     if not groq_client:
@@ -618,6 +694,7 @@ async def send_reply_in_preferred_format(message, text, voice_reply=False):
 # GRUPPENSTEUERUNG
 # ============================================================
 
+
 def is_group(chat_type):
     return chat_type in (ChatType.GROUP, ChatType.SUPERGROUP)
 
@@ -653,6 +730,7 @@ def is_stop_phrase(text):
 # ============================================================
 # TEXTNACHRICHTEN VERARBEITEN
 # ============================================================
+
 
 async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
     message = update.effective_message
@@ -695,6 +773,7 @@ async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
 # SPRACHNACHRICHTEN VERARBEITEN
 # ============================================================
 
+
 async def handle_voice(update: Update, context: ContextTypes.DEFAULT_TYPE):
     message = update.effective_message
     chat = update.effective_chat
@@ -706,7 +785,9 @@ async def handle_voice(update: Update, context: ContextTypes.DEFAULT_TYPE):
     now = asyncio.get_running_loop().time()
 
     if group and now >= group_active_until.get(chat.id, 0):
-        await message.reply_text("Sprich mich bitte zuerst mit „Nexus“ an. 😊")
+        await message.reply_text(
+            "Sprich mich bitte zuerst mit „Nexus“ an. 😊"
+        )
         return
 
     if not groq_client:
@@ -759,6 +840,7 @@ async def handle_voice(update: Update, context: ContextTypes.DEFAULT_TYPE):
 # FOTOS ANALYSIEREN — GEMINI
 # ============================================================
 
+
 async def handle_photo(update: Update, context: ContextTypes.DEFAULT_TYPE):
     message = update.effective_message
     chat = update.effective_chat
@@ -805,7 +887,6 @@ async def handle_photo(update: Update, context: ContextTypes.DEFAULT_TYPE):
         with open(path, "rb") as image_file:
             image_bytes = image_file.read()
 
-        # KORREKT: Bilddaten als unterstütztes Part-Objekt übergeben.
         image_part = types.Part.from_bytes(
             data=image_bytes,
             mime_type="image/jpeg",
@@ -835,8 +916,6 @@ async def handle_photo(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     except Exception as exc:
         logger.exception("Fotoanalyse fehlgeschlagen.")
-
-        # Die Details stehen in Render Runtime Logs.
         error_text = str(exc).lower()
 
         if "api key" in error_text or "api_key" in error_text or "unauthorized" in error_text:
@@ -885,6 +964,7 @@ async def handle_photo(update: Update, context: ContextTypes.DEFAULT_TYPE):
 # FEHLERBEHANDLUNG
 # ============================================================
 
+
 async def on_error(update: object, context: ContextTypes.DEFAULT_TYPE):
     if context.error:
         logger.error(
@@ -902,6 +982,7 @@ async def on_error(update: object, context: ContextTypes.DEFAULT_TYPE):
 # ============================================================
 # TELEGRAM-APPLICATION EINRICHTEN
 # ============================================================
+
 
 def build_application():
     application = Application.builder().token(TELEGRAM_TOKEN).build()
@@ -926,6 +1007,7 @@ def build_application():
 # ============================================================
 # TELEGRAM-BOT ASYNCHRON STARTEN
 # ============================================================
+
 
 async def run_bot_async():
     application = build_application()
