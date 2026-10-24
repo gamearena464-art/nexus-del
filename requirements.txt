@@ -1,10 +1,8 @@
-Flask==3.0.0
-python-telegram-bot==20.7
-groq==0.4.2
-google-genai
-edge-tts==6.1.9
-Pillow
-requests==2.31.0
-moviepy==1.0.3
-yt-dlp
+flask
 gunicorn
+python-telegram-bot==20.8
+groq
+google-genai
+pillow
+requests
+edge-tts
