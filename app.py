@@ -35,19 +35,16 @@ TELEGRAM_TOKEN = os.getenv("TELEGRAM_TOKEN", "").strip()
 GROQ_API_KEY = os.getenv("GROQ_API_KEY", "").strip()
 GEMINI_API_KEY = os.getenv("GEMINI_API_KEY", "").strip()
 
+# Aktuelles Standardmodell bei Groq
 GROQ_MODEL = os.getenv(
     "GROQ_MODEL",
-    "llama-3.3-70b-versatile",
+    "openai/gpt-oss-120b",
 ).strip()
 
 GEMINI_MODEL = os.getenv(
     "GEMINI_MODEL",
     "gemini-2.5-flash",
 ).strip()
-
-# ==================================================
-# FLASK / RENDER
-# ==================================================
 
 app = Flask(__name__)
 
@@ -68,6 +65,10 @@ history_lock = threading.Lock()
 MAX_HISTORY_MESSAGES = 12
 
 
+# ==================================================
+# RENDER HEALTH CHECKS
+# ==================================================
+
 @app.route("/")
 def home():
     return jsonify({
@@ -85,50 +86,40 @@ def health():
 
 
 # ==================================================
-# TELEGRAM-BEFEHLE
+# TELEGRAM BEFEHLE
 # ==================================================
 
-async def start_command(
-    update: Update,
-    context: ContextTypes.DEFAULT_TYPE,
-):
+async def start_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     message = update.effective_message
     if not message:
         return
 
     await message.reply_text(
         "🌌 Willkommen bei NEXUS KI-Assistent!\n\n"
-        "Ich helfe dir bei Fragen und kann Bilder analysieren.\n\n"
-        "Befehle:\n"
-        "/start – Begrüßung\n"
-        "/hilfe – Hilfe anzeigen\n"
+        "Ich beantworte Fragen und kann Bilder analysieren.\n\n"
+        "/start – Start\n"
+        "/hilfe – Hilfe\n"
         "/reset – Gespräch zurücksetzen\n"
         "/bild Beschreibung – Bild erstellen\n\n"
         "Schreib mir einfach eine Nachricht."
     )
 
 
-async def help_command(
-    update: Update,
-    context: ContextTypes.DEFAULT_TYPE,
-):
+async def help_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     message = update.effective_message
     if not message:
         return
 
     await message.reply_text(
-        "🤖 NEXUS – Hilfe\n\n"
+        "🤖 NEXUS Hilfe\n\n"
         "• Schreibe eine Frage für eine KI-Antwort.\n"
-        "• Sende ein Foto, um es analysieren zu lassen.\n"
-        "• Nutze /bild gefolgt von einer Bildbeschreibung.\n"
-        "• Nutze /reset, um den Gesprächsverlauf zu löschen."
+        "• Sende ein Foto zur Bildanalyse.\n"
+        "• /bild gefolgt von einer Beschreibung erstellt ein Bild.\n"
+        "• /reset löscht den Gesprächsverlauf."
     )
 
 
-async def reset_command(
-    update: Update,
-    context: ContextTypes.DEFAULT_TYPE,
-):
+async def reset_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     message = update.effective_message
     chat = update.effective_chat
 
@@ -138,23 +129,19 @@ async def reset_command(
     with history_lock:
         chat_histories.pop(chat.id, None)
 
-    await message.reply_text(
-        "♻️ Dein Gesprächsverlauf wurde zurückgesetzt."
-    )
+    await message.reply_text("♻️ Dein Gesprächsverlauf wurde zurückgesetzt.")
 
 
 # ==================================================
-# GROQ – TEXT-KI
+# GROQ TEXT-KI
 # ==================================================
 
 def ask_groq(chat_id: int, prompt: str) -> str:
     if not GROQ_API_KEY or not groq_client:
-        logger.error(
-            "Groq-Konfiguration fehlt: GROQ_API_KEY ist nicht gesetzt."
-        )
+        logger.error("GROQ_API_KEY fehlt.")
         return (
             "⚠️ Der Groq-API-Schlüssel fehlt. "
-            "Bitte GROQ_API_KEY in Render → Environment prüfen."
+            "Bitte GROQ_API_KEY in Render → Environment eintragen."
         )
 
     with history_lock:
@@ -164,9 +151,8 @@ def ask_groq(chat_id: int, prompt: str) -> str:
         {
             "role": "system",
             "content": (
-                "Du bist NEXUS, ein hilfreicher und freundlicher "
-                "KI-Assistent. Antworte klar und verständlich. "
-                "Wenn der Nutzer Deutsch schreibt, antworte auf Deutsch."
+                "Du bist NEXUS, ein hilfreicher, freundlicher KI-Assistent. "
+                "Antworte verständlich und möglichst auf Deutsch."
             ),
         },
         *history,
@@ -177,8 +163,7 @@ def ask_groq(chat_id: int, prompt: str) -> str:
         result = groq_client.chat.completions.create(
             model=GROQ_MODEL,
             messages=messages,
-            temperature=0.7,
-            max_tokens=1200,
+            max_completion_tokens=1200,
         )
 
         answer = result.choices[0].message.content
@@ -202,67 +187,42 @@ def ask_groq(chat_id: int, prompt: str) -> str:
         error_type = type(exc).__name__
         status_code = getattr(exc, "status_code", None)
 
-        # Keine API-Schlüssel oder Request-Header protokollieren.
+        # Niemals API-Schlüssel oder Request-Header protokollieren.
         logger.error(
-            "Groq-Anfrage fehlgeschlagen: Typ=%s, HTTP-Status=%s, "
-            "Modell=%s, Details=%s",
+            "Groq-Fehler: Typ=%s, HTTP=%s, Modell=%s, Details=%s",
             error_type,
             status_code,
             GROQ_MODEL,
-            str(exc)[:500],
+            str(exc)[:400],
         )
 
         if error_type == "AuthenticationError" or status_code == 401:
-            return (
-                "🔑 Groq hat den API-Schlüssel abgelehnt. "
-                "Bitte GROQ_API_KEY in Render → Environment prüfen."
-            )
+            return "🔑 Groq hat den API-Schlüssel abgelehnt. Prüfe GROQ_API_KEY in Render."
 
         if status_code == 403:
-            return (
-                "⛔ Groq hat den Zugriff verweigert. "
-                "Bitte Kontostatus und API-Berechtigungen prüfen."
-            )
+            return "⛔ Groq verweigert den Zugriff. Prüfe Kontostatus und API-Berechtigungen."
 
         if status_code == 404:
             return (
-                "⚠️ Das Groq-Modell wurde nicht gefunden. "
-                "Bitte GROQ_MODEL in Render → Environment prüfen."
+                f"⚠️ Groq kennt das Modell '{GROQ_MODEL}' nicht "
+                "oder es ist für deinen Zugang nicht verfügbar. "
+                "Prüfe GROQ_MODEL in Render → Environment."
             )
 
         if error_type == "RateLimitError" or status_code == 429:
-            return (
-                "⏳ Das Groq-Anfragelimit wurde erreicht. "
-                "Bitte Kontingent und Abrechnung prüfen."
-            )
+            return "⏳ Groq-Limit erreicht. Prüfe dein Kontingent und versuche es später erneut."
 
         if error_type == "APIConnectionError":
-            return (
-                "🌐 Groq ist momentan nicht erreichbar. "
-                "Bitte später erneut versuchen."
-            )
-
-        if status_code == 400:
-            return (
-                "⚠️ Groq hat die Anfrage abgelehnt. "
-                "Bitte Modell und Anfrageparameter in den Render-Logs prüfen."
-            )
+            return "🌐 Groq ist nicht erreichbar. Bitte versuche es später erneut."
 
         return (
-            f"⚠️ Groq-Fehler: {error_type}"
-            + (
-                f" (HTTP {status_code})"
-                if status_code is not None
-                else ""
-            )
-            + ". Bitte Render → Logs prüfen."
+            f"⚠️ Groq-Anfrage fehlgeschlagen ({error_type}"
+            + (f", HTTP {status_code}" if status_code else "")
+            + "). Bitte Render → Logs prüfen."
         )
 
 
-async def text_message(
-    update: Update,
-    context: ContextTypes.DEFAULT_TYPE,
-):
+async def text_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
     message = update.effective_message
     chat = update.effective_chat
 
@@ -273,14 +233,13 @@ async def text_message(
     if not user_text:
         return
 
-    # In Gruppen nur auf Erwähnungen oder Antworten an den Bot reagieren.
+    # In Gruppen nur bei Erwähnung oder direkter Antwort reagieren.
     if chat.type in ("group", "supergroup"):
         bot_username = context.bot.username or ""
 
         mentioned = (
             f"@{bot_username.lower()}" in user_text.lower()
-            if bot_username
-            else False
+            if bot_username else False
         )
 
         replied_to_bot = (
@@ -293,10 +252,7 @@ async def text_message(
             return
 
         if bot_username:
-            user_text = user_text.replace(
-                f"@{bot_username}",
-                "",
-            ).strip()
+            user_text = user_text.replace(f"@{bot_username}", "").strip()
 
         if not user_text:
             await message.reply_text("Was möchtest du wissen?")
@@ -305,17 +261,12 @@ async def text_message(
     status = await message.reply_text("🤖 NEXUS denkt nach …")
 
     try:
-        answer = await asyncio.to_thread(
-            ask_groq,
-            chat.id,
-            user_text,
-        )
+        answer = await asyncio.to_thread(ask_groq, chat.id, user_text)
 
-        # Telegram erlaubt höchstens 4096 Zeichen pro Nachricht.
         chunks = [
             answer[i:i + 4000]
             for i in range(0, len(answer), 4000)
-        ] or ["Ich habe leider keine Antwort erhalten."]
+        ] or ["Ich habe keine Antwort erhalten."]
 
         await status.edit_text(chunks[0])
 
@@ -323,33 +274,25 @@ async def text_message(
             await message.reply_text(chunk)
 
     except Exception:
-        logger.exception("Fehler bei der Textverarbeitung")
-
+        logger.exception("Fehler bei der Telegram-Textverarbeitung")
         try:
-            await status.edit_text(
-                "⚠️ Bei der Verarbeitung ist ein Fehler aufgetreten."
-            )
+            await status.edit_text("⚠️ Bei der Verarbeitung ist ein Fehler aufgetreten.")
         except Exception:
             pass
 
 
 # ==================================================
-# GEMINI – BILDANALYSE
+# GEMINI BILDANALYSE
 # ==================================================
 
-async def photo_message(
-    update: Update,
-    context: ContextTypes.DEFAULT_TYPE,
-):
+async def photo_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
     message = update.effective_message
-
     if not message:
         return
 
     if not gemini_client:
         await message.reply_text(
-            "⚠️ Für die Bildanalyse fehlt GEMINI_API_KEY "
-            "in Render → Environment."
+            "⚠️ GEMINI_API_KEY fehlt. Bitte in Render → Environment eintragen."
         )
         return
 
@@ -358,15 +301,9 @@ async def photo_message(
     try:
         photo = message.photo[-1]
         telegram_file = await context.bot.get_file(photo.file_id)
+        image_bytes = bytes(await telegram_file.download_as_bytearray())
 
-        image_bytes = bytes(
-            await telegram_file.download_as_bytearray()
-        )
-
-        image = Image.open(
-            io.BytesIO(image_bytes)
-        ).convert("RGB")
-
+        image = Image.open(io.BytesIO(image_bytes)).convert("RGB")
         prompt = (
             message.caption.strip()
             if message.caption
@@ -380,14 +317,13 @@ async def photo_message(
         )
 
         answer = (getattr(result, "text", None) or "").strip()
-
         if not answer:
             answer = "Ich konnte das Bild leider nicht beschreiben."
 
         chunks = [
             answer[i:i + 4000]
             for i in range(0, len(answer), 4000)
-        ]
+        ] or ["Keine Bildbeschreibung verfügbar."]
 
         await status.edit_text(chunks[0])
 
@@ -398,28 +334,23 @@ async def photo_message(
         logger.error(
             "Gemini-Bildanalyse fehlgeschlagen: Typ=%s, Details=%s",
             type(exc).__name__,
-            str(exc)[:500],
+            str(exc)[:400],
         )
-
         try:
             await status.edit_text(
-                "⚠️ Die Bildanalyse ist fehlgeschlagen. "
-                "Bitte GEMINI_API_KEY und GEMINI_MODEL in Render prüfen."
+                "⚠️ Bildanalyse fehlgeschlagen. Prüfe GEMINI_API_KEY "
+                "und GEMINI_MODEL in Render."
             )
         except Exception:
             pass
 
 
 # ==================================================
-# /BILD – BILDER ERSTELLEN
+# /BILD – BILDER GENERIEREN
 # ==================================================
 
-async def image_command(
-    update: Update,
-    context: ContextTypes.DEFAULT_TYPE,
-):
+async def image_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     message = update.effective_message
-
     if not message:
         return
 
@@ -427,9 +358,8 @@ async def image_command(
 
     if not prompt:
         await message.reply_text(
-            "Bitte gib eine Bildbeschreibung an.\n\n"
-            "Beispiel:\n"
-            "/bild eine leuchtende Energie-Welt im Weltraum"
+            "Bitte gib eine Bildbeschreibung an.\n"
+            "Beispiel: /bild eine leuchtende Energie-Welt im Weltraum"
         )
         return
 
@@ -447,111 +377,75 @@ async def image_command(
             image_url,
             timeout=90,
         )
-
         response.raise_for_status()
 
-        content_type = response.headers.get("content-type", "")
-
-        if not content_type.startswith("image/"):
-            raise ValueError("Der Bilddienst lieferte keine Bilddatei.")
+        if not response.headers.get("content-type", "").startswith("image/"):
+            raise ValueError("Der Bilddienst hat keine Bilddatei geliefert.")
 
         await message.reply_photo(
             photo=io.BytesIO(response.content),
             caption=f"🎨 NEXUS – {prompt[:900]}",
         )
-
         await status.delete()
 
     except Exception as exc:
         logger.error(
             "Bildgenerierung fehlgeschlagen: Typ=%s, Details=%s",
             type(exc).__name__,
-            str(exc)[:500],
+            str(exc)[:400],
         )
-
         try:
             await status.edit_text(
                 "⚠️ Das Bild konnte nicht erstellt werden. "
-                "Der externe Bilddienst ist möglicherweise nicht verfügbar. "
-                "Bitte versuche es später erneut."
+                "Der externe Bilddienst ist möglicherweise nicht verfügbar."
             )
         except Exception:
             pass
 
 
 # ==================================================
-# UNBEKANNTE BEFEHLE UND FEHLER
+# UNBEKANNTE BEFEHLE UND TELEGRAM-FEHLER
 # ==================================================
 
-async def unknown_command(
-    update: Update,
-    context: ContextTypes.DEFAULT_TYPE,
-):
+async def unknown_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     message = update.effective_message
-
     if message:
-        await message.reply_text(
-            "Diesen Befehl kenne ich nicht. Nutze /hilfe."
-        )
+        await message.reply_text("Diesen Befehl kenne ich nicht. Nutze /hilfe.")
 
 
-async def error_handler(
-    update: object,
-    context: ContextTypes.DEFAULT_TYPE,
-):
+async def error_handler(update: object, context: ContextTypes.DEFAULT_TYPE):
     error = context.error
-
     if error:
         logger.error(
             "Unbehandelter Telegram-Fehler: Typ=%s, Details=%s",
             type(error).__name__,
-            str(error)[:500],
+            str(error)[:400],
         )
 
 
 # ==================================================
-# TELEGRAM-BOT STARTEN
+# TELEGRAM BOT START
 # ==================================================
 
 def run_telegram_bot():
     if not TELEGRAM_TOKEN:
-        logger.error(
-            "TELEGRAM_TOKEN fehlt. "
-            "Bitte in Render → Environment eintragen."
-        )
+        logger.error("TELEGRAM_TOKEN fehlt. Telegram wird nicht gestartet.")
         return
 
     try:
-        telegram_app = (
-            Application.builder()
-            .token(TELEGRAM_TOKEN)
-            .build()
-        )
+        telegram_app = Application.builder().token(TELEGRAM_TOKEN).build()
 
-        telegram_app.add_handler(
-            CommandHandler("start", start_command)
-        )
-        telegram_app.add_handler(
-            CommandHandler("hilfe", help_command)
-        )
-        telegram_app.add_handler(
-            CommandHandler("help", help_command)
-        )
-        telegram_app.add_handler(
-            CommandHandler("reset", reset_command)
-        )
-        telegram_app.add_handler(
-            CommandHandler("bild", image_command)
-        )
+        telegram_app.add_handler(CommandHandler("start", start_command))
+        telegram_app.add_handler(CommandHandler("hilfe", help_command))
+        telegram_app.add_handler(CommandHandler("help", help_command))
+        telegram_app.add_handler(CommandHandler("reset", reset_command))
+        telegram_app.add_handler(CommandHandler("bild", image_command))
 
         telegram_app.add_handler(
             MessageHandler(filters.PHOTO, photo_message)
         )
         telegram_app.add_handler(
-            MessageHandler(
-                filters.TEXT & ~filters.COMMAND,
-                text_message,
-            )
+            MessageHandler(filters.TEXT & ~filters.COMMAND, text_message)
         )
         telegram_app.add_handler(
             MessageHandler(filters.COMMAND, unknown_command)
@@ -560,19 +454,18 @@ def run_telegram_bot():
         telegram_app.add_error_handler(error_handler)
 
         logger.info("NEXUS Telegram-Bot wird gestartet.")
-
         telegram_app.run_polling(stop_signals=None)
 
     except Exception as exc:
         logger.error(
             "Telegram-Bot konnte nicht starten: Typ=%s, Details=%s",
             type(exc).__name__,
-            str(exc)[:500],
+            str(exc)[:400],
         )
 
 
 # ==================================================
-# HINTERGRUND-THREAD FÜR TELEGRAM
+# HINTERGRUND-THREAD
 # ==================================================
 
 _bot_thread = None
