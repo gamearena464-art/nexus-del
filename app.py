@@ -4,8 +4,7 @@ import io
 import os
 import re
 import urllib.parse
-import edge_tts
-from flask import Flask
+from flask import Flask, request
 from google import genai
 from google.genai import types
 from groq import Groq
@@ -22,13 +21,11 @@ from telegram.ext import (
 
 app = Flask(__name__)
 
-@app.route("/")
-def home():
-    return "NEXUS KI-Assistent läuft!"
-
+# --- API KEYS ---
 TELEGRAM_TOKEN = os.environ.get("TELEGRAM_TOKEN")
 GROQ_API_KEY = os.environ.get("GROQ_API_KEY")
 GEMINI_API_KEY = os.environ.get("GEMINI_API_KEY")
+RENDER_EXTERNAL_URL = os.environ.get("RENDER_EXTERNAL_URL")  # Wird von Render automatisch gesetzt!
 
 groq_client = Groq(api_key=GROQ_API_KEY) if GROQ_API_KEY else None
 gemini_client = genai.Client(api_key=GEMINI_API_KEY) if GEMINI_API_KEY else None
@@ -40,9 +37,6 @@ NEXUS_SYSTEM_PROMPT = (
 )
 
 user_chat_history = defaultdict(list)
-user_memories = defaultdict(list)
-active_group_chats = {}
-MAX_HISTORY = 12
 
 def format_for_telegram(text: str) -> str:
     if not text:
@@ -82,19 +76,37 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
     except Exception as e:
         print(f"Fehler: {e}")
 
-# Bot wird direkt beim Start initialisiert
+# Telegram Bot Instanz vorbereiten
 bot_app = ApplicationBuilder().token(TELEGRAM_TOKEN).build()
 bot_app.add_handler(CommandHandler("start", start))
 bot_app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_message))
 
-if __name__ == "__main__":
-    import threading
-    def run_bot():
-        bot_app.run_polling()
-    
-    t = threading.Thread(target=run_bot)
-    t.daemon = True
-    t.start()
+@app.route("/")
+def home():
+    return "NEXUS KI-Assistent läuft via Webhook!"
 
+# HTTP-Endpunkt für Telegram Webhook Nachrichten
+@app.route(f"/{TELEGRAM_TOKEN}", methods=["POST"])
+async def webhook():
+    if request.method == "POST":
+        async with bot_app:
+            update = Update.de_json(request.get_json(force=True), bot_app.bot)
+            await bot_app.process_update(update)
+    return "OK", 200
+
+# Webhook bei Telegram automatisch registrieren
+def set_telegram_webhook():
+    if RENDER_EXTERNAL_URL and TELEGRAM_TOKEN:
+        url = f"{RENDER_EXTERNAL_URL}/{TELEGRAM_TOKEN}"
+        webhook_url = f"[https://api.telegram.org/bot](https://api.telegram.org/bot){TELEGRAM_TOKEN}/setWebhook?url={url}"
+        try:
+            r = requests.get(webhook_url)
+            print(f"Webhook Set-up Status: {r.json()}")
+        except Exception as e:
+            print(f"Webhook Fehler: {e}")
+
+set_telegram_webhook()
+
+if __name__ == "__main__":
     port = int(os.environ.get("PORT", 10000))
     app.run(host="0.0.0.0", port=port)
