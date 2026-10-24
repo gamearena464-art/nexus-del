@@ -4,7 +4,6 @@ import io
 import os
 import re
 import urllib.parse
-import threading
 import edge_tts
 from flask import Flask
 from google import genai
@@ -21,14 +20,12 @@ from telegram.ext import (
     filters,
 )
 
-# --- WEBSERVER ---
 app = Flask(__name__)
 
 @app.route("/")
 def home():
     return "NEXUS KI-Assistent läuft!"
 
-# --- API KEYS ---
 TELEGRAM_TOKEN = os.environ.get("TELEGRAM_TOKEN")
 GROQ_API_KEY = os.environ.get("GROQ_API_KEY")
 GEMINI_API_KEY = os.environ.get("GEMINI_API_KEY")
@@ -46,7 +43,6 @@ user_chat_history = defaultdict(list)
 user_memories = defaultdict(list)
 active_group_chats = {}
 MAX_HISTORY = 12
-STANDBY_TIMEOUT_MINUTES = 3
 
 def format_for_telegram(text: str) -> str:
     if not text:
@@ -56,15 +52,6 @@ def format_for_telegram(text: str) -> str:
     text = re.sub(r"\*\*(.*?)\*\*", r"<b>\1</b>", text)
     text = re.sub(r"(?<!\*)\*(?!\*)(.*?)(?<!\*)\*(?!\*)", r"<i>\1</i>", text)
     return text.strip()
-
-def get_chat_models():
-    try:
-        return ["llama-3.3-70b-versatile", "llama-3.1-8b-instant"]
-    except Exception:
-        return ["llama-3.3-70b-versatile"]
-
-def get_gemini_models():
-    return ["gemini-2.5-flash", "gemini-1.5-flash"]
 
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text(
@@ -95,22 +82,19 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
     except Exception as e:
         print(f"Fehler: {e}")
 
-# --- BOT DIREKT BEIM LADEN IM HINTERGRUND STARTEN (FÜR GUNICORN) ---
-def run_telegram_bot():
-    if not TELEGRAM_TOKEN:
-        print("FEHLER: TELEGRAM_TOKEN fehlt!")
-        return
-    bot_app = ApplicationBuilder().token(TELEGRAM_TOKEN).build()
-    bot_app.add_handler(CommandHandler("start", start))
-    bot_app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_message))
-    print("Telegram Bot gestartet (Polling)...")
-    bot_app.run_polling()
-
-# Thread starten, egal ob lokal oder via Gunicorn
-bot_thread = threading.Thread(target=run_telegram_bot)
-bot_thread.daemon = True
-bot_thread.start()
+# Bot wird direkt beim Start initialisiert
+bot_app = ApplicationBuilder().token(TELEGRAM_TOKEN).build()
+bot_app.add_handler(CommandHandler("start", start))
+bot_app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_message))
 
 if __name__ == "__main__":
+    import threading
+    def run_bot():
+        bot_app.run_polling()
+    
+    t = threading.Thread(target=run_bot)
+    t.daemon = True
+    t.start()
+
     port = int(os.environ.get("PORT", 10000))
     app.run(host="0.0.0.0", port=port)
