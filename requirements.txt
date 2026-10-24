@@ -3,7 +3,7 @@ python-telegram-bot==20.7
 groq==0.4.2
 google-generativeai
 edge-tts==6.1.9
-Pillow==10.2.0
+Pillow
 requests==2.31.0
 moviepy==1.0.3
 yt-dlp
