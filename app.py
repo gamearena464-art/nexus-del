@@ -1,3 +1,4 @@
+
 import os
 import re
 import html
@@ -24,15 +25,28 @@ from telegram.ext import (
 )
 
 # ============================================================
-# NEXUS KI-ASSISTENT – Render + Telegram
+# NEXUS KI-ASSISTENT — Render + Telegram
+#
+# Benötigte Render-Variablen:
+# TELEGRAM_TOKEN
+# GROQ_API_KEY
+#
+# Optionale Variablen:
+# GROQ_MODEL
+# WHISPER_MODEL
+# EDGE_TTS_VOICE
+# GEMINI_API_KEY
+# GEMINI_MODEL
+# DATABASE_PATH
 # ============================================================
 
 logging.basicConfig(
     format="%(asctime)s %(levelname)s %(name)s: %(message)s",
-    level=os.getenv("LOG_LEVEL", "INFO").upper(),
+    level=os.getenv("LOG_LEVEL", "INFO"),
 )
 logger = logging.getLogger("nexus")
 
+# Flask-Webserver für Render
 app = Flask(__name__)
 
 
@@ -43,28 +57,37 @@ def home():
 
 @app.get("/health")
 def health():
-    return {
-        "status": "ok",
-        "telegram_token_configured": bool(TELEGRAM_TOKEN),
-        "groq_configured": bool(GROQ_API_KEY),
-        "gemini_configured": bool(GEMINI_API_KEY),
-    }, 200
+    return "OK", 200
 
+
+# ============================================================
+# EINSTELLUNGEN
+# Bestehende Render-Umgebungsvariablen bleiben erhalten.
+# ============================================================
 
 TELEGRAM_TOKEN = os.getenv("TELEGRAM_TOKEN", "").strip()
 GROQ_API_KEY = os.getenv("GROQ_API_KEY", "").strip()
+
 GROQ_MODEL = os.getenv(
-    "GROQ_MODEL", "llama-3.3-70b-versatile"
+    "GROQ_MODEL",
+    "llama-3.3-70b-versatile",
 ).strip()
+
 WHISPER_MODEL = os.getenv(
-    "WHISPER_MODEL", "whisper-large-v3"
+    "WHISPER_MODEL",
+    "whisper-large-v3",
 ).strip()
+
 EDGE_TTS_VOICE = os.getenv(
-    "EDGE_TTS_VOICE", "de-DE-ConradNeural"
+    "EDGE_TTS_VOICE",
+    "de-DE-ConradNeural",
 ).strip()
+
 GEMINI_API_KEY = os.getenv("GEMINI_API_KEY", "").strip()
+
 GEMINI_MODEL = os.getenv(
-    "GEMINI_MODEL", "gemini-2.5-flash"
+    "GEMINI_MODEL",
+    "gemini-2.5-flash",
 ).strip()
 
 DATABASE_PATH = os.getenv(
@@ -74,61 +97,74 @@ DATABASE_PATH = os.getenv(
     else "nexus_memory.sqlite3",
 )
 
-MAX_HISTORY_MESSAGES = 12
-GROUP_ACTIVE_SECONDS = 180
-MAX_TELEGRAM_LENGTH = 3800
+if not TELEGRAM_TOKEN:
+    logger.warning(
+        "TELEGRAM_TOKEN fehlt. Telegram-Bot wird nicht gestartet."
+    )
+
+if not GROQ_API_KEY:
+    logger.warning(
+        "GROQ_API_KEY fehlt. KI-Antworten funktionieren nicht."
+    )
 
 groq_client = Groq(api_key=GROQ_API_KEY) if GROQ_API_KEY else None
 
-chat_history = defaultdict(list)
-group_active_until = {}
+
+# ============================================================
+# KI-PROMPT
+# ============================================================
 
 SYSTEM_PROMPT = """
 Du bist NEXUS, ein freundlicher deutscher KI-Assistent.
 
-ANTWORTSTIL:
-- Antworte auf Deutsch, freundlich und verständlich.
-- Erkläre Dinge einfach, aber nicht unnötig kindlich.
-- Nutze passende Emojis, jedoch nicht in jedem Satz.
-- Verwende klare Überschriften und Absätze.
-- Setze nach Überschriften eine Leerzeile.
+Antworte auf Deutsch, kurz, klar und leicht verständlich.
+Nutze bei Bedarf wenige passende Emojis und eine moderne,
+übersichtliche Formatierung.
+
+WICHTIG FÜR DIE FORMATIERUNG:
+- Verwende klare, kurze Überschriften.
+- Setze zwischen Überschrift und Erklärung eine Leerzeile.
 - Trenne unterschiedliche Themen durch Leerzeilen.
-- Verwende für wichtige Überschriften und Begriffe Markdown-Fettschrift.
-- Nutze nummerierte Listen für Schritt-für-Schritt-Erklärungen.
-- Nutze Aufzählungspunkte für Listen.
-- Erkläre Dinge mit kurzen, verständlichen Sätzen.
-- Halte einfache Antworten kurz und ausführliche Erklärungen übersichtlich.
-- Gib keine ununterbrochenen Textblöcke aus.
-- Vermeide unnötige Wiederholungen.
-- Erfinde keine Fakten. Wenn du etwas nicht weißt, sage es ehrlich.
+- Verwende Aufzählungen, wenn sie das Verständnis verbessern.
+- Verwende keine riesigen Textblöcke.
+- Verwende Telegram-kompatible Markdown-Formatierung.
+- Setze Fettformatierung sparsam und korrekt ein.
+- Erfinde keine Fakten.
+- Wenn du etwas nicht weißt, sage es ehrlich.
 
-BEISPIEL FÜR DEINE FORMATIERUNG:
-
-🚗 **1. Das Lenkrad**
-
-Mit dem Lenkrad bestimmst du, in welche Richtung das Auto fährt.
-
-⚙️ **2. Der Motor**
-
-Der Motor erzeugt die Kraft, die das Auto antreibt.
-
-Wenn du nach dem Erfinder von NEXUS gefragt wirst, antworte:
-„Der liebe Heiko aus dem Schwabenländle. 😊“
+Wenn jemand fragt, wer dich programmiert oder erfunden hat,
+antworte:
+"Der liebe Heiko aus dem Schwabenländle. 😊"
 
 Du bist freundlich, geduldig und respektvoll.
-Nutze gespeicherte Erinnerungen nur, wenn sie zur Frage passen.
 """.strip()
 
 
 # ============================================================
-# DATENBANK / GEDÄCHTNIS
+# CHATVERLAUF UND GRUPPENSTATUS
+# ============================================================
+
+chat_history = defaultdict(list)
+group_active_until = {}
+
+MAX_HISTORY_MESSAGES = 12
+GROUP_ACTIVE_SECONDS = 180
+
+
+# ============================================================
+# DATENBANK
 # ============================================================
 
 def db_connect():
     path = Path(DATABASE_PATH)
     path.parent.mkdir(parents=True, exist_ok=True)
-    connection = sqlite3.connect(str(path), timeout=30)
+
+    connection = sqlite3.connect(
+        str(path),
+        timeout=30,
+    )
     connection.execute("PRAGMA journal_mode=WAL")
+
     return connection
 
 
@@ -144,6 +180,7 @@ def init_db():
                     PRIMARY KEY (chat_id, memory_key)
                 )
             """)
+
             conn.execute("""
                 CREATE TABLE IF NOT EXISTS conversation_log (
                     id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -153,16 +190,23 @@ def init_db():
                     created_at TEXT NOT NULL
                 )
             """)
+
     except Exception:
-        logger.exception("Datenbank konnte nicht initialisiert werden.")
+        logger.exception(
+            "Datenbank konnte nicht initialisiert werden."
+        )
 
 
 def save_memory(chat_id, key, value):
     try:
         with db_connect() as conn:
             conn.execute("""
-                INSERT INTO memories
-                    (chat_id, memory_key, memory_value, updated_at)
+                INSERT INTO memories (
+                    chat_id,
+                    memory_key,
+                    memory_value,
+                    updated_at
+                )
                 VALUES (?, ?, ?, ?)
                 ON CONFLICT(chat_id, memory_key)
                 DO UPDATE SET
@@ -174,9 +218,13 @@ def save_memory(chat_id, key, value):
                 value[:1000],
                 datetime.now(timezone.utc).isoformat(),
             ))
+
         return True
+
     except Exception:
-        logger.exception("Speichern der Erinnerung fehlgeschlagen.")
+        logger.exception(
+            "Speichern der Erinnerung fehlgeschlagen."
+        )
         return False
 
 
@@ -193,9 +241,13 @@ def get_memories(chat_id, limit=30):
                 """,
                 (str(chat_id), limit),
             ).fetchall()
+
         return rows
+
     except Exception:
-        logger.exception("Lesen der Erinnerungen fehlgeschlagen.")
+        logger.exception(
+            "Lesen der Erinnerungen fehlgeschlagen."
+        )
         return []
 
 
@@ -205,13 +257,18 @@ def forget_memory(chat_id, key):
             cur = conn.execute(
                 """
                 DELETE FROM memories
-                WHERE chat_id=? AND memory_key LIKE ?
+                WHERE chat_id=?
+                AND memory_key LIKE ?
                 """,
                 (str(chat_id), f"%{key}%"),
             )
+
             return cur.rowcount
+
     except Exception:
-        logger.exception("Löschen der Erinnerung fehlgeschlagen.")
+        logger.exception(
+            "Löschen der Erinnerung fehlgeschlagen."
+        )
         return 0
 
 
@@ -220,8 +277,12 @@ def log_message(chat_id, role, content):
         with db_connect() as conn:
             conn.execute(
                 """
-                INSERT INTO conversation_log
-                    (chat_id, role, content, created_at)
+                INSERT INTO conversation_log (
+                    chat_id,
+                    role,
+                    content,
+                    created_at
+                )
                 VALUES (?, ?, ?, ?)
                 """,
                 (
@@ -231,9 +292,16 @@ def log_message(chat_id, role, content):
                     datetime.now(timezone.utc).isoformat(),
                 ),
             )
-    except Exception:
-        logger.exception("Nachrichtenprotokoll konnte nicht gespeichert werden.")
 
+    except Exception:
+        logger.exception(
+            "Nachrichtenprotokoll konnte nicht gespeichert werden."
+        )
+
+
+# ============================================================
+# ERINNERUNGEN AUTOMATISCH ERKENNEN
+# ============================================================
 
 def learn_from_text(chat_id, text):
     patterns = [
@@ -248,171 +316,118 @@ def learn_from_text(chat_id, text):
     ]
 
     for pattern, key in patterns:
-        match = re.search(pattern, text, flags=re.IGNORECASE)
+        match = re.search(
+            pattern,
+            text,
+            flags=re.IGNORECASE,
+        )
+
         if match:
             value = match.group(1).strip(" .!?")
-            if value and save_memory(chat_id, key, value):
-                return f"🧠 **Alles klar, ich merke mir das!**\n\n{key}: {value}"
+
+            if value:
+                save_memory(chat_id, key, value)
+
+                return (
+                    f"Alles klar, ich merke mir: "
+                    f"{key} – {value} 😊"
+                )
+
     return None
 
 
+def escape_html(text):
+    return html.escape(text or "", quote=False)
+
+
 # ============================================================
-# FORMATIERUNG FÜR TELEGRAM
+# NACHRICHTEN SENDEN
 # ============================================================
 
-def format_for_telegram(text):
-    """Konvertiert einfache Markdown-Formatierung sicher in Telegram-HTML."""
-    if not text:
-        return ""
-
-    text = text.strip()
-
-    # Erst Sonderzeichen escapen, damit kein fremdes HTML ausgeführt wird.
-    safe = html.escape(text, quote=False)
-
-    # Codeblöcke
-    safe = re.sub(
-        r"```(?:[a-zA-Z0-9_+-]+)?[ \t]*\n?([\s\S]*?)```",
-        lambda m: "<pre>" + m.group(1).strip("\n") + "</pre>",
-        safe,
-    )
-
-    # Inline-Code
-    safe = re.sub(
-        r"`([^`\n]+)`",
-        r"<code>\1</code>",
-        safe,
-    )
-
-    # Fett und kursiv – ohne über mehrere Zeilen zu greifen.
-    safe = re.sub(
-        r"\*\*([^\n]+?)\*\*",
-        r"<b>\1</b>",
-        safe,
-    )
-    safe = re.sub(
-        r"(?<!\*)\*([^*\n]+?)\*(?!\*)",
-        r"<i>\1</i>",
-        safe,
-    )
-
-    # Überschriften wie ### Titel werden fett ausgegeben.
-    safe = re.sub(
-        r"(?m)^\s{0,3}#{1,6}\s+(.+?)\s*$",
-        r"<b>\1</b>",
-        safe,
-    )
-
-    # Markdown-Zitatzeichen entfernen.
-    safe = re.sub(r"(?m)^\s*&gt;\s?", "", safe)
-
-    # Mehr als zwei Leerzeilen vermeiden.
-    safe = re.sub(r"\n{3,}", "\n\n", safe)
-
-    return safe.strip()
-
-
-def split_text_safely(text, limit=MAX_TELEGRAM_LENGTH):
-    """Teilt lange Rohtexte an Absätzen oder Wortgrenzen."""
+async def send_long_text(message, text, parse_mode=None):
     text = text or "Entschuldigung, ich habe gerade keine Antwort."
-    chunks = []
-    current = ""
 
-    for paragraph in text.split("\n\n"):
-        candidate = paragraph if not current else current + "\n\n" + paragraph
-
-        if len(candidate) <= limit:
-            current = candidate
-            continue
-
-        if current:
-            chunks.append(current)
-            current = ""
-
-        # Sehr lange Absätze an Wortgrenzen aufteilen.
-        while len(paragraph) > limit:
-            cut = paragraph.rfind(" ", 0, limit)
-            if cut < 1:
-                cut = limit
-            chunks.append(paragraph[:cut])
-            paragraph = paragraph[cut:].lstrip()
-
-        current = paragraph
-
-    if current:
-        chunks.append(current)
-
-    return chunks or ["Entschuldigung, ich habe gerade keine Antwort."]
-
-
-async def send_long_text(message, text, parse_mode="HTML"):
-    raw_chunks = split_text_safely(text)
-
-    for chunk in raw_chunks:
-        formatted = format_for_telegram(chunk)
-
-        try:
-            await message.reply_text(
-                formatted,
-                parse_mode="HTML" if parse_mode else None,
-                disable_web_page_preview=True,
-            )
-        except Exception:
-            # Bei ungültigem HTML lieber lesbaren Text senden,
-            # statt die Antwort vollständig ausfallen zu lassen.
-            logger.exception("Formatierte Telegram-Nachricht fehlgeschlagen.")
-            plain = re.sub(r"<[^>]+>", "", formatted)
-            await message.reply_text(
-                html.unescape(plain)[:MAX_TELEGRAM_LENGTH]
-            )
+    # Telegram erlaubt ungefähr 4096 Zeichen je Nachricht.
+    # Bei normalem Text bleiben wir unter dieser Grenze.
+    for start in range(0, len(text), 4000):
+        await message.reply_text(
+            text[start:start + 4000],
+            parse_mode=parse_mode,
+        )
 
 
 # ============================================================
-# KI-ANTWORTEN
+# GROQ-KI-ANTWORT
 # ============================================================
 
 def get_ai_reply(chat_id, user_text):
     if not groq_client:
         return (
-            "⚠️ **Meine KI ist noch nicht verbunden.**\n\n"
-            "Bitte prüfe den GROQ_API_KEY in den Render-Environment-Variablen."
+            "Meine KI ist noch nicht verbunden. "
+            "Bitte prüfe den GROQ_API_KEY in Render."
         )
 
     memories = get_memories(chat_id)
+
     memory_text = "\n".join(
-        f"- {key}: {value}" for key, value in memories
+        f"- {key}: {value}"
+        for key, value in memories
     )
 
-    messages = [{"role": "system", "content": SYSTEM_PROMPT}]
+    messages = [
+        {
+            "role": "system",
+            "content": SYSTEM_PROMPT,
+        }
+    ]
 
     if memory_text:
         messages.append({
             "role": "system",
-            "content": "Gespeicherte Erinnerungen für diesen Chat:\n" + memory_text,
+            "content": (
+                "Gespeicherte Erinnerungen für diesen Chat:\n"
+                + memory_text
+            ),
         })
 
-    messages.extend(chat_history[str(chat_id)][-MAX_HISTORY_MESSAGES:])
-    messages.append({"role": "user", "content": user_text})
+    messages.extend(
+        chat_history[str(chat_id)][-MAX_HISTORY_MESSAGES:]
+    )
+
+    messages.append({
+        "role": "user",
+        "content": user_text,
+    })
 
     try:
         result = groq_client.chat.completions.create(
             model=GROQ_MODEL,
             messages=messages,
-            temperature=0.6,
-            max_tokens=700,
+            temperature=0.7,
+            max_tokens=400,
         )
 
         answer = (
             result.choices[0].message.content
             or "Ich habe gerade keine Antwort."
-        ).strip()
+        )
 
         history = chat_history[str(chat_id)]
+
         history.extend([
-            {"role": "user", "content": user_text[:3000]},
-            {"role": "assistant", "content": answer[:3000]},
+            {
+                "role": "user",
+                "content": user_text[:3000],
+            },
+            {
+                "role": "assistant",
+                "content": answer[:3000],
+            },
         ])
-        chat_history[str(chat_id)] = history[-MAX_HISTORY_MESSAGES:]
+
+        chat_history[str(chat_id)] = history[
+            -MAX_HISTORY_MESSAGES:
+        ]
 
         log_message(chat_id, "user", user_text)
         log_message(chat_id, "assistant", answer)
@@ -421,61 +436,66 @@ def get_ai_reply(chat_id, user_text):
 
     except Exception:
         logger.exception("Groq-Anfrage fehlgeschlagen.")
+
         return (
-            "⚠️ **Meine KI hat gerade ein Problem.**\n\n"
-            "Bitte prüfe GROQ_API_KEY und GROQ_MODEL in Render."
+            "Ups, meine KI hat gerade ein Problem. "
+            "Prüfe bitte den GROQ_API_KEY und GROQ_MODEL in Render."
         )
 
 
 # ============================================================
-# TELEGRAM-BEFEHLE
+# /START
 # ============================================================
 
-async def start_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    message = update.effective_message
-    if not message:
-        return
-
-    welcome = """
-👋 **Hallo! Ich bin NEXUS, dein KI-Assistent.**
-
-🧠 **Das kann ich für dich tun:**
-
-• Fragen beantworten und Dinge erklären
-• Bilder erstellen mit `/bild Beschreibung`
-• Fotos analysieren
-• Sprachnachrichten verstehen und beantworten
-• Informationen für später speichern
-
-📌 **Meine Befehle**
-
-`/merken Text` – etwas speichern
-`/gedaechtnis` – gespeicherte Erinnerungen ansehen
-`/vergiss Text` – eine Erinnerung löschen
-`/reset` – den kurzen Chatverlauf zurücksetzen
-`/bild Beschreibung` – ein Bild erstellen
-"""
-    await send_long_text(message, welcome)
+async def start_command(
+    update: Update,
+    context: ContextTypes.DEFAULT_TYPE,
+):
+    await update.effective_message.reply_text(
+        "Hallo! Ich bin NEXUS, dein KI-Assistent. 🤖\n\n"
+        "Schreib mir einfach eine Nachricht.\n\n"
+        "Befehle:\n"
+        "/merken Text – etwas speichern\n"
+        "/gedaechtnis – Erinnerungen ansehen\n"
+        "/vergiss Text – Erinnerung löschen\n"
+        "/reset – Chat-Verlauf zurücksetzen\n"
+        "/bild Beschreibung – Bild erstellen"
+    )
 
 
-async def reset_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+# ============================================================
+# /RESET
+# ============================================================
+
+async def reset_command(
+    update: Update,
+    context: ContextTypes.DEFAULT_TYPE,
+):
     chat_id = str(update.effective_chat.id)
+
     chat_history.pop(chat_id, None)
 
     await update.effective_message.reply_text(
-        "🧹 Der kurze Chatverlauf wurde zurückgesetzt.\n\n"
+        "Der kurze Chat-Verlauf wurde zurückgesetzt. 🧹\n"
         "Gespeicherte Erinnerungen bleiben erhalten."
     )
 
 
-async def remember_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+# ============================================================
+# /MERKEN
+# ============================================================
+
+async def remember_command(
+    update: Update,
+    context: ContextTypes.DEFAULT_TYPE,
+):
     chat_id = update.effective_chat.id
     value = " ".join(context.args).strip()
 
     if not value:
         await update.effective_message.reply_text(
-            "✏️ Schreib bitte dazu, was ich mir merken soll.\n\n"
-            "Beispiel: `/merken Mein Hobby ist Wandern`"
+            "Schreib bitte dazu, was ich mir merken soll.\n"
+            "Beispiel: /merken Mein Hobby ist Wandern"
         )
         return
 
@@ -483,85 +503,114 @@ async def remember_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     if ":" in value:
         possible_key, possible_value = value.split(":", 1)
+
         if possible_key.strip() and possible_value.strip():
             key = possible_key.strip()
             value = possible_value.strip()
 
     if save_memory(chat_id, key, value):
-        await send_long_text(
-            update.effective_message,
-            f"🧠 **Gespeichert!**\n\n**{key}:** {value}",
+        await update.effective_message.reply_text(
+            f"Gespeichert! 🧠\n{key}: {value}"
         )
     else:
         await update.effective_message.reply_text(
-            "⚠️ Ich konnte das leider nicht speichern. "
+            "Ich konnte das leider nicht speichern. "
             "Prüfe den Datenbankpfad in Render."
         )
 
 
-async def memories_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+# ============================================================
+# /GEDAECHTNIS
+# ============================================================
+
+async def memories_command(
+    update: Update,
+    context: ContextTypes.DEFAULT_TYPE,
+):
     memories = get_memories(update.effective_chat.id)
 
     if not memories:
         await update.effective_message.reply_text(
-            "🧠 Ich habe hier noch keine gespeicherten Erinnerungen."
+            "Ich habe hier noch keine gespeicherten Erinnerungen. 🧠"
         )
         return
 
-    text = "🧠 **Das habe ich gespeichert:**\n\n"
-    text += "\n\n".join(
-        f"• **{key}:** {value}" for key, value in memories
+    text = (
+        "🧠 Das habe ich gespeichert:\n\n"
+        + "\n".join(
+            f"• {key}: {value}"
+            for key, value in memories
+        )
     )
 
-    await send_long_text(update.effective_message, text)
+    await send_long_text(
+        update.effective_message,
+        text,
+    )
 
 
-async def forget_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+# ============================================================
+# /VERGISS
+# ============================================================
+
+async def forget_command(
+    update: Update,
+    context: ContextTypes.DEFAULT_TYPE,
+):
     key = " ".join(context.args).strip()
 
     if not key:
         await update.effective_message.reply_text(
-            "✏️ Schreib bitte dazu, was ich vergessen soll.\n\n"
-            "Beispiel: `/vergiss Hobby`"
+            "Schreib bitte dazu, was ich vergessen soll.\n"
+            "Beispiel: /vergiss Hobby"
         )
         return
 
-    count = forget_memory(update.effective_chat.id, key)
+    count = forget_memory(
+        update.effective_chat.id,
+        key,
+    )
 
     if count:
         await update.effective_message.reply_text(
-            "🧹 Die passende Erinnerung wurde gelöscht."
+            "Erinnerung gelöscht. 🧹"
         )
     else:
         await update.effective_message.reply_text(
-            "🔎 Ich habe dazu keine passende Erinnerung gefunden."
+            "Ich habe dazu keine passende Erinnerung gefunden."
         )
 
 
 # ============================================================
-# BILDER ERSTELLEN
+# /BILD — BILDERSTELLUNG
 # ============================================================
 
-async def image_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+async def image_command(
+    update: Update,
+    context: ContextTypes.DEFAULT_TYPE,
+):
     prompt = " ".join(context.args).strip()
-    message = update.effective_message
 
     if not prompt:
-        await message.reply_text(
-            "🎨 Bitte beschreibe dein Wunschbild.\n\n"
-            "Beispiel: `/bild ein leuchtender Energieplanet im Weltall`"
+        await update.effective_message.reply_text(
+            "Bitte schreibe eine Bildbeschreibung dazu.\n"
+            "Beispiel: /bild ein leuchtender Energieplanet im Weltall"
         )
         return
 
-    status = await message.reply_text(
-        "🎨 Ich versuche, dein Bild zu erstellen. Einen Moment bitte …"
+    await update.effective_message.reply_text(
+        "Ich versuche, dein Bild zu erstellen. 🎨"
     )
 
     temp_path = None
 
     try:
-        url = "https://image.pollinations.ai/prompt/" + requests.utils.quote(prompt)
+        url = (
+            "https://image.pollinations.ai/prompt/"
+            + requests.utils.quote(prompt)
+        )
 
+        # Abruf erfolgt außerhalb des Telegram-Event-Loops.
         def download_image():
             response = requests.get(
                 url,
@@ -570,64 +619,79 @@ async def image_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
                     "height": 1024,
                     "nologo": "true",
                 },
-                timeout=(15, 90),
-                headers={"User-Agent": "NEXUS-Telegram-Bot/1.0"},
+                timeout=90,
             )
             response.raise_for_status()
 
-            if "image" not in response.headers.get("content-type", ""):
-                raise RuntimeError("Der Bilddienst hat keine Bilddatei geliefert.")
+            content_type = response.headers.get(
+                "content-type",
+                "",
+            ).lower()
+
+            if not content_type.startswith("image/"):
+                raise RuntimeError(
+                    "Der Bilddienst hat kein echtes Bild geliefert. "
+                    f"Content-Type: {content_type}"
+                )
+
+            if not response.content:
+                raise RuntimeError(
+                    "Der Bilddienst hat eine leere Datei geliefert."
+                )
 
             return response.content
 
         image_bytes = await asyncio.to_thread(download_image)
 
-        with tempfile.NamedTemporaryFile(suffix=".jpg", delete=False) as tmp:
+        with tempfile.NamedTemporaryFile(
+            suffix=".jpg",
+            delete=False,
+        ) as tmp:
             tmp.write(image_bytes)
             temp_path = tmp.name
 
-        try:
-            await status.delete()
-        except Exception:
-            pass
-
         with open(temp_path, "rb") as photo:
-            await message.reply_photo(
+            await update.effective_message.reply_photo(
                 photo=photo,
-                caption=f"🖼 Dein Bild ist fertig!\n\n📌 Wunsch: {prompt[:850]}",
+                caption=prompt[:900],
             )
 
-    except Exception:
-        logger.exception("Bildgenerierung fehlgeschlagen.")
-        try:
-            await status.edit_text(
-                "🙈 Das Bild konnte gerade nicht erstellt werden. "
-                "Bitte versuche es später erneut."
-            )
-        except Exception:
-            await message.reply_text(
-                "🙈 Das Bild konnte gerade nicht erstellt werden."
-            )
+    except Exception as exc:
+        logger.exception(
+            "Bildgenerierung fehlgeschlagen (%s): %s",
+            type(exc).__name__,
+            str(exc),
+        )
+
+        await update.effective_message.reply_text(
+            "⚠️ Das Bild konnte gerade nicht erstellt werden. "
+            "Der genaue Fehler steht in den Render-Logs."
+        )
 
     finally:
-        if temp_path and os.path.exists(temp_path):
+        if temp_path:
             try:
                 os.remove(temp_path)
             except OSError:
-                pass
+                logger.warning(
+                    "Temporäre Bilddatei konnte nicht gelöscht werden."
+                )
 
 
 # ============================================================
-# SPRACHNACHRICHTEN
+# SPRACHERKENNUNG — GROQ WHISPER
 # ============================================================
 
-def transcribe_voice_sync(file_path):
+async def transcribe_voice(file_path):
     if not groq_client:
         return None
 
     with open(file_path, "rb") as audio_file:
         transcription = groq_client.audio.transcriptions.create(
-            file=(os.path.basename(file_path), audio_file.read()),
+            file=(
+                os.path.basename(file_path),
+                audio_file.read(),
+            ),
             model=WHISPER_MODEL,
             response_format="text",
             language="de",
@@ -636,85 +700,116 @@ def transcribe_voice_sync(file_path):
     if isinstance(transcription, str):
         return transcription.strip()
 
-    return getattr(transcription, "text", "").strip()
+    return getattr(
+        transcription,
+        "text",
+        "",
+    ).strip()
 
+
+# ============================================================
+# SPRACHAUSGABE — EDGE TTS
+# ============================================================
 
 async def make_voice_file(text, path):
     try:
         import edge_tts
+
         communicate = edge_tts.Communicate(
             text[:3000],
             EDGE_TTS_VOICE,
         )
+
         await communicate.save(path)
+
         return True
+
     except Exception:
         logger.exception("Sprachausgabe fehlgeschlagen.")
         return False
 
 
-async def send_reply_in_preferred_format(message, text, voice_reply=False):
+async def send_reply_in_preferred_format(
+    message,
+    text,
+    voice_reply=False,
+):
     if voice_reply:
-        voice_path = None
+        with tempfile.NamedTemporaryFile(
+            suffix=".mp3",
+            delete=False,
+        ) as tmp:
+            voice_path = tmp.name
 
         try:
-            with tempfile.NamedTemporaryFile(
-                suffix=".mp3", delete=False
-            ) as tmp:
-                voice_path = tmp.name
-
             if await make_voice_file(text, voice_path):
                 with open(voice_path, "rb") as audio:
                     await message.reply_voice(voice=audio)
+
                 return
 
         finally:
-            if voice_path and os.path.exists(voice_path):
-                try:
-                    os.remove(voice_path)
-                except OSError:
-                    pass
+            try:
+                os.remove(voice_path)
+            except OSError:
+                pass
 
     await send_long_text(message, text)
 
 
+# ============================================================
+# GRUPPENFUNKTIONEN
+# ============================================================
+
 def is_group(chat_type):
-    return chat_type in (ChatType.GROUP, ChatType.SUPERGROUP)
+    return chat_type in (
+        ChatType.GROUP,
+        ChatType.SUPERGROUP,
+    )
 
 
 def is_addressed(text, bot_username=""):
     low = (text or "").lower().strip()
-    username = (bot_username or "").lower().lstrip("@")
+    username = bot_username.lower().lstrip("@")
 
     if username and f"@{username}" in low:
         return True
 
     return bool(
-        re.search(r"\b(nexus|ki-assistent|ki assistent|bot)\b", low)
+        re.search(
+            r"\b(nexus|ki-assistent|ki assistent|bot)\b",
+            low,
+        )
     )
 
 
 def is_stop_phrase(text):
     low = (text or "").lower().strip()
 
-    return any(phrase in low for phrase in (
-        "nexus aus",
-        "nexus stopp",
-        "stopp nexus",
-        "ruhe nexus",
-        "tschüss nexus",
-        "auf wiedersehen nexus",
-        "geh offline",
-        "sei still nexus",
-        "nexus schlaf",
-    ))
+    return any(
+        phrase in low
+        for phrase in (
+            "nexus aus",
+            "nexus stopp",
+            "stopp nexus",
+            "ruhe nexus",
+            "tschüss nexus",
+            "auf wiedersehen nexus",
+            "geh offline",
+            "sei still nexus",
+            "nexus schlaf",
+        )
+    )
 
 
 # ============================================================
-# TEXTNACHRICHTEN UND GRUPPENMODUS
+# TEXTNACHRICHTEN VERARBEITEN
 # ============================================================
 
-async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
+async def handle_text(
+    update: Update,
+    context: ContextTypes.DEFAULT_TYPE,
+):
     message = update.effective_message
     chat = update.effective_chat
 
@@ -726,101 +821,145 @@ async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
     now = asyncio.get_running_loop().time()
 
     if group:
-        addressed = is_addressed(text, context.bot.username or "")
+        addressed = is_addressed(
+            text,
+            context.bot.username or "",
+        )
 
-        if is_stop_phrase(text) and (
-            addressed or now < group_active_until.get(chat.id, 0)
+        if (
+            is_stop_phrase(text)
+            and (
+                addressed
+                or now < group_active_until.get(chat.id, 0)
+            )
         ):
             group_active_until.pop(chat.id, None)
+
             await message.reply_text(
-                "🤫 Alles klar, ich bin jetzt ruhig."
+                "Alles klar, ich bin jetzt ruhig. 👋"
             )
             return
 
         if addressed:
-            group_active_until[chat.id] = now + GROUP_ACTIVE_SECONDS
+            group_active_until[chat.id] = (
+                now + GROUP_ACTIVE_SECONDS
+            )
         elif now >= group_active_until.get(chat.id, 0):
             return
 
     learned = learn_from_text(chat.id, text)
 
     if learned:
-        await send_long_text(message, learned)
+        await message.reply_text(learned)
         return
 
-    reply = await asyncio.to_thread(get_ai_reply, chat.id, text)
+    reply = await asyncio.to_thread(
+        get_ai_reply,
+        chat.id,
+        text,
+    )
+
     await send_reply_in_preferred_format(
-        message, reply, voice_reply=False
+        message,
+        reply,
+        voice_reply=False,
     )
 
 
-async def handle_voice(update: Update, context: ContextTypes.DEFAULT_TYPE):
+# ============================================================
+# SPRACHNACHRICHTEN VERARBEITEN
+# ============================================================
+
+async def handle_voice(
+    update: Update,
+    context: ContextTypes.DEFAULT_TYPE,
+):
     message = update.effective_message
     chat = update.effective_chat
 
     if not message or not chat or not message.voice:
         return
 
-    if is_group(chat.type):
-        now = asyncio.get_running_loop().time()
-        if now >= group_active_until.get(chat.id, 0):
-            await message.reply_text(
-                "🎙 Sprich mich bitte zuerst mit „Nexus“ an."
-            )
-            return
+    group = is_group(chat.type)
+    now = asyncio.get_running_loop().time()
+
+    if (
+        group
+        and now >= group_active_until.get(chat.id, 0)
+    ):
+        await message.reply_text(
+            "Sprich mich bitte zuerst mit „Nexus“ an. 😊"
+        )
+        return
 
     if not groq_client:
         await message.reply_text(
-            "⚠️ Meine Spracherkennung ist noch nicht verbunden. "
+            "Meine Spracherkennung ist noch nicht verbunden. "
             "Bitte prüfe GROQ_API_KEY."
         )
         return
 
-    await message.reply_text("🎧 Ich höre zu …")
+    await message.reply_text("Ich höre zu … 🎧")
+
     file_path = None
 
     try:
-        tg_file = await context.bot.get_file(message.voice.file_id)
+        tg_file = await context.bot.get_file(
+            message.voice.file_id
+        )
 
         with tempfile.NamedTemporaryFile(
-            suffix=".ogg", delete=False
+            suffix=".ogg",
+            delete=False,
         ) as tmp:
             file_path = tmp.name
 
         await tg_file.download_to_drive(file_path)
 
         spoken_text = await asyncio.to_thread(
-            transcribe_voice_sync, file_path
+            lambda: asyncio.run(
+                transcribe_voice(file_path)
+            )
         )
 
         if not spoken_text:
             await message.reply_text(
-                "🙈 Ich konnte die Sprachnachricht leider nicht verstehen."
+                "Ich konnte die Sprachnachricht leider nicht verstehen."
             )
             return
 
-        learned = learn_from_text(chat.id, spoken_text)
+        learned = learn_from_text(
+            chat.id,
+            spoken_text,
+        )
 
         if learned:
-            await send_long_text(message, learned)
+            await message.reply_text(learned)
             return
 
         reply = await asyncio.to_thread(
-            get_ai_reply, chat.id, spoken_text
+            get_ai_reply,
+            chat.id,
+            spoken_text,
         )
 
         await send_reply_in_preferred_format(
-            message, reply, voice_reply=True
+            message,
+            reply,
+            voice_reply=True,
         )
 
     except Exception:
-        logger.exception("Verarbeitung der Sprachnachricht fehlgeschlagen.")
+        logger.exception(
+            "Verarbeitung der Sprachnachricht fehlgeschlagen."
+        )
+
         await message.reply_text(
-            "⚠️ Beim Verarbeiten der Sprachnachricht ist ein Fehler passiert."
+            "Beim Verarbeiten der Sprachnachricht ist ein Fehler passiert."
         )
 
     finally:
-        if file_path and os.path.exists(file_path):
+        if file_path:
             try:
                 os.remove(file_path)
             except OSError:
@@ -828,31 +967,40 @@ async def handle_voice(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 
 # ============================================================
-# FOTOANALYSE MIT GEMINI
+# FOTOANALYSE — GEMINI
 # ============================================================
 
-async def handle_photo(update: Update, context: ContextTypes.DEFAULT_TYPE):
+async def handle_photo(
+    update: Update,
+    context: ContextTypes.DEFAULT_TYPE,
+):
     message = update.effective_message
     chat = update.effective_chat
 
-    if not message or not chat or not message.photo:
+    if not message or not message.photo or not chat:
         return
 
     if not GEMINI_API_KEY:
         await message.reply_text(
-            "⚠️ Für die Fotoanalyse fehlt GEMINI_API_KEY in Render."
+            "Für Fotoanalyse fehlt noch GEMINI_API_KEY in Render."
         )
         return
 
-    caption = message.caption or (
-        "Beschreibe dieses Bild auf Deutsch in einfachen Worten."
+    caption = (
+        message.caption
+        or "Beschreibe dieses Bild auf Deutsch in einfachen Worten."
     )
 
+    # Gruppenverhalten beibehalten
     if is_group(chat.type):
         now = asyncio.get_running_loop().time()
+
         if (
             now >= group_active_until.get(chat.id, 0)
-            and not is_addressed(caption, context.bot.username or "")
+            and not is_addressed(
+                caption,
+                context.bot.username or "",
+            )
         ):
             return
 
@@ -860,14 +1008,20 @@ async def handle_photo(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     try:
         from google import genai
-        client = genai.Client(api_key=GEMINI_API_KEY)
+        from google.genai import types
 
+        client = genai.Client(
+            api_key=GEMINI_API_KEY
+        )
+
+        # Foto aus Telegram laden
         photo_file = await context.bot.get_file(
             message.photo[-1].file_id
         )
 
         with tempfile.NamedTemporaryFile(
-            suffix=".jpg", delete=False
+            suffix=".jpg",
+            delete=False,
         ) as tmp:
             path = tmp.name
 
@@ -876,148 +1030,196 @@ async def handle_photo(update: Update, context: ContextTypes.DEFAULT_TYPE):
         with open(path, "rb") as image_file:
             image_bytes = image_file.read()
 
-        result = await asyncio.to_thread(
-            lambda: client.models.generate_content(
+        if not image_bytes:
+            raise ValueError(
+                "Die heruntergeladene Bilddatei ist leer."
+            )
+
+        # Gemini erhält den Text und die Bilddaten
+        def analyze_photo():
+            return client.models.generate_content(
                 model=GEMINI_MODEL,
                 contents=[
                     caption,
-                    {
-                        "mime_type": "image/jpeg",
-                        "data": image_bytes,
-                    },
+                    types.Part.from_bytes(
+                        data=image_bytes,
+                        mime_type="image/jpeg",
+                    ),
                 ],
             )
+
+        result = await asyncio.to_thread(
+            analyze_photo
         )
 
-        answer = getattr(result, "text", "") or (
-            "Ich konnte das Bild leider nicht beschreiben."
+        answer = getattr(
+            result,
+            "text",
+            None,
         )
 
-        await send_long_text(message, answer)
+        if not answer or not answer.strip():
+            logger.error(
+                "Gemini hat keinen lesbaren Antworttext geliefert."
+            )
 
-    except Exception:
-        logger.exception("Fotoanalyse fehlgeschlagen.")
+            await message.reply_text(
+                "Ich konnte das Bild nicht beschreiben. "
+                "Bitte versuche es mit einem anderen Foto erneut."
+            )
+            return
+
+        await send_long_text(
+            message,
+            answer.strip(),
+        )
+
+    except Exception as exc:
+        # Konkrete Fehler protokollieren.
+        # API-Schlüssel nicht in die Fehlermeldung aufnehmen.
+        logger.exception(
+            "Fotoanalyse fehlgeschlagen (%s): %s",
+            type(exc).__name__,
+            str(exc),
+        )
+
         await message.reply_text(
-            "⚠️ Die Fotoanalyse hat gerade nicht funktioniert. "
-            "Prüfe GEMINI_API_KEY und GEMINI_MODEL."
+            "⚠️ Die Fotoanalyse ist fehlgeschlagen. "
+            "Der genaue Fehler steht jetzt in den Render-Logs."
         )
 
     finally:
-        if path and os.path.exists(path):
+        if path:
             try:
                 os.remove(path)
             except OSError:
-                pass
+                logger.warning(
+                    "Temporäre Fotodatei konnte nicht gelöscht werden."
+                )
 
 
 # ============================================================
 # FEHLERBEHANDLUNG
 # ============================================================
 
-async def on_error(update: object, context: ContextTypes.DEFAULT_TYPE):
+async def on_error(
+    update: object,
+    context: ContextTypes.DEFAULT_TYPE,
+):
     logger.error(
-        "Telegram-Fehler",
+        "Telegram-Fehler: %s",
+        context.error,
         exc_info=(
             type(context.error),
             context.error,
-            context.error.__traceback__ if context.error else None,
-        ),
+            context.error.__traceback__,
+        ) if context.error else None,
     )
 
 
 # ============================================================
 # TELEGRAM-BOT STARTEN
-# Wichtig: Kein run_polling() im Hintergrund-Thread!
 # ============================================================
 
-async def bot_runner():
+def main():
+    init_db()
+
     if not TELEGRAM_TOKEN:
         logger.error(
-            "Telegram-Bot startet nicht: TELEGRAM_TOKEN fehlt."
+            "Bot startet nicht: TELEGRAM_TOKEN fehlt."
         )
         return
 
-    telegram_app = Application.builder().token(TELEGRAM_TOKEN).build()
+    application = (
+        Application.builder()
+        .token(TELEGRAM_TOKEN)
+        .build()
+    )
 
-    telegram_app.add_handler(
+    application.add_handler(
         CommandHandler("start", start_command)
     )
-    telegram_app.add_handler(
+
+    application.add_handler(
         CommandHandler("reset", reset_command)
     )
-    telegram_app.add_handler(
+
+    application.add_handler(
         CommandHandler("merken", remember_command)
     )
-    telegram_app.add_handler(
+
+    application.add_handler(
         CommandHandler("gedaechtnis", memories_command)
     )
-    telegram_app.add_handler(
+
+    application.add_handler(
         CommandHandler("vergiss", forget_command)
     )
-    telegram_app.add_handler(
+
+    application.add_handler(
         CommandHandler("bild", image_command)
     )
-    telegram_app.add_handler(
+
+    application.add_handler(
         MessageHandler(filters.VOICE, handle_voice)
     )
-    telegram_app.add_handler(
+
+    application.add_handler(
         MessageHandler(filters.PHOTO, handle_photo)
     )
-    telegram_app.add_handler(
+
+    application.add_handler(
         MessageHandler(
             filters.TEXT & ~filters.COMMAND,
             handle_text,
         )
     )
-    telegram_app.add_error_handler(on_error)
 
-    try:
-        await telegram_app.initialize()
-        await telegram_app.start()
+    application.add_error_handler(on_error)
 
-        if telegram_app.updater is None:
-            raise RuntimeError("Telegram-Updater ist nicht verfügbar.")
+    logger.info("NEXUS Telegram-Bot startet.")
 
-        await telegram_app.updater.start_polling(
-            drop_pending_updates=False
-        )
+    # Polling bleibt wie bisher eingerichtet.
+    application.run_polling(
+        drop_pending_updates=False
+    )
 
-        logger.info("NEXUS Telegram-Bot ist gestartet.")
 
-        # Bot-Eventloop am Leben halten, bis der Prozess beendet wird.
-        await asyncio.Event().wait()
+# ============================================================
+# HINTERGRUNDTHREAD FÜR RENDER / GUNICORN
+# ============================================================
 
-    finally:
-        if telegram_app.updater and telegram_app.updater.running:
-            await telegram_app.updater.stop()
-
-        if telegram_app.running:
-            await telegram_app.stop()
-
-        await telegram_app.shutdown()
+_bot_thread = None
 
 
 def start_bot_thread():
+    global _bot_thread
+
+    if _bot_thread and _bot_thread.is_alive():
+        return
+
     if not TELEGRAM_TOKEN:
-        logger.error(
-            "Bot bleibt aus: TELEGRAM_TOKEN fehlt in Render."
+        logger.warning(
+            "Telegram-Bot bleibt aus, da TELEGRAM_TOKEN fehlt."
         )
         return
 
     def runner():
         try:
-            init_db()
-            asyncio.run(bot_runner())
+            main()
         except Exception:
-            logger.exception("Telegram-Bot konnte nicht gestartet werden.")
+            logger.exception(
+                "Telegram-Bot konnte nicht gestartet werden."
+            )
 
-    thread = threading.Thread(
+    _bot_thread = threading.Thread(
         target=runner,
         name="nexus-telegram-bot",
         daemon=True,
     )
-    thread.start()
+
+    _bot_thread.start()
 
 
-# Nur einmal starten, wenn dieses Modul von Gunicorn geladen wird.
+# Bot beim Import durch Gunicorn starten
 start_bot_thread()
