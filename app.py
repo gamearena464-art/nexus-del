@@ -1,111 +1,61 @@
-from collections import defaultdict
-import datetime
-import io
 import os
-import re
-import urllib.parse
-from flask import Flask, request
-from google import genai
-from google.genai import types
-from groq import Groq
-from PIL import Image
 import requests
-from telegram import Update
-from telegram.ext import (
-    ApplicationBuilder,
-    CommandHandler,
-    ContextTypes,
-    MessageHandler,
-    filters,
-)
+from flask import Flask, request, jsonify
 
 app = Flask(__name__)
 
-# --- API KEYS ---
-TELEGRAM_TOKEN = os.environ.get("TELEGRAM_TOKEN")
-GROQ_API_KEY = os.environ.get("GROQ_API_KEY")
-GEMINI_API_KEY = os.environ.get("GEMINI_API_KEY")
-RENDER_EXTERNAL_URL = os.environ.get("RENDER_EXTERNAL_URL")  # Wird von Render automatisch gesetzt!
+# 1. Token und Render-URL sicher aus den Environment Variables laden
+TELEGRAM_TOKEN = os.environ.get("TELEGRAM_TOKEN", "").strip()
+RENDER_EXTERNAL_URL = os.environ.get("RENDER_EXTERNAL_URL", "https://nexus-del.onrender.com").strip()
 
-groq_client = Groq(api_key=GROQ_API_KEY) if GROQ_API_KEY else None
-gemini_client = genai.Client(api_key=GEMINI_API_KEY) if GEMINI_API_KEY else None
-
-NEXUS_SYSTEM_PROMPT = (
-    "Du bist der NEXUS KI-Assistent. Antworte IMMER ultrakurz, knackig und so einfach, "
-    "als würdest du es einem 4-jährigen Kind erklären! Nutze Emojis (✨, 💡, 🚀). "
-    "Dein Erfinder ist Heiko aus dem schönen Schwabenländle! 😊"
-)
-
-user_chat_history = defaultdict(list)
-
-def format_for_telegram(text: str) -> str:
-    if not text:
-        return ""
-    text = text.replace("```", "")
-    text = re.sub(r"^\s*>\s?", "", text, flags=re.MULTILINE)
-    text = re.sub(r"\*\*(.*?)\*\*", r"<b>\1</b>", text)
-    text = re.sub(r"(?<!\*)\*(?!\*)(.*?)(?<!\*)\*(?!\*)", r"<i>\1</i>", text)
-    return text.strip()
-
-async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    await update.message.reply_text(
-        format_for_telegram("Huhu! 👋 Ich bin der **NEXUS KI-Assistent** von Heiko aus dem Schwabenländle! 🌟"),
-        parse_mode="HTML"
-    )
-
-async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    chat_id = update.effective_chat.id
-    user_text = update.message.text
-    if not user_text:
+# 2. Automatische Webhook-Registrierung beim Start
+def setup_webhook():
+    if not TELEGRAM_TOKEN:
+        print("❌ FEHLER: Kein TELEGRAM_TOKEN in den Environment Variables gefunden!")
         return
-    
-    user_chat_history[chat_id].append({"role": "user", "content": user_text})
-    messages_payload = [{"role": "system", "content": NEXUS_SYSTEM_PROMPT}] + list(user_chat_history[chat_id])
+
+    # Exakte Telegram-API-URL ohne Leerzeichen oder doppelte Protokolle
+    webhook_target_url = f"{RENDER_EXTERNAL_URL}/{TELEGRAM_TOKEN}"
+    telegram_api_url = f"https://api.telegram.org/bot{TELEGRAM_TOKEN}/setWebhook"
 
     try:
-        response = groq_client.chat.completions.create(
-            model="llama-3.1-8b-instant",
-            messages=messages_payload,
-            temperature=0.6,
-            max_tokens=250,
-        )
-        reply = response.choices[0].message.content
-        if reply:
-            user_chat_history[chat_id].append({"role": "assistant", "content": reply})
-            await update.message.reply_text(format_for_telegram(reply), parse_mode="HTML")
+        response = requests.post(telegram_api_url, data={"url": webhook_target_url}, timeout=10)
+        res_data = response.json()
+        if res_data.get("ok"):
+            print(f"✅ Webhook erfolgreich gesetzt auf: {webhook_target_url}")
+        else:
+            print(f"❌ Webhook-Fehler von Telegram: {res_data.get('description')}")
     except Exception as e:
-        print(f"Fehler: {e}")
+        print(f"❌ Fehler bei der Webhook-Verbindung: {e}")
 
-# Telegram Bot Instanz vorbereiten
-bot_app = ApplicationBuilder().token(TELEGRAM_TOKEN).build()
-bot_app.add_handler(CommandHandler("start", start))
-bot_app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_message))
+# Webhook-Einrichtung ausführen
+setup_webhook()
 
-@app.route("/")
-def home():
-    return "NEXUS KI-Assistent läuft via Webhook!"
-
-# HTTP-Endpunkt für Telegram Webhook Nachrichten
+# 3. Route für die Webhook-Benachrichtigungen von Telegram
 @app.route(f"/{TELEGRAM_TOKEN}", methods=["POST"])
-async def webhook():
-    if request.method == "POST":
-        async with bot_app:
-            update = Update.de_json(request.get_json(force=True), bot_app.bot)
-            await bot_app.process_update(update)
-    return "OK", 200
+def telegram_webhook():
+    update = request.get_json()
+    if not update:
+        return jsonify({"status": "error", "message": "No JSON payload"}), 400
 
-# Webhook bei Telegram automatisch registrieren
-def set_telegram_webhook():
-    if RENDER_EXTERNAL_URL and TELEGRAM_TOKEN:
-        url = f"{RENDER_EXTERNAL_URL}/{TELEGRAM_TOKEN}"
-        webhook_url = f"[https://api.telegram.org/bot](https://api.telegram.org/bot){TELEGRAM_TOKEN}/setWebhook?url={url}"
-        try:
-            r = requests.get(webhook_url)
-            print(f"Webhook Set-up Status: {r.json()}")
-        except Exception as e:
-            print(f"Webhook Fehler: {e}")
+    # Überprüfen, ob eine Textnachricht vorliegt
+    if "message" in update and "text" in update["message"]:
+        chat_id = update["message"]["chat"]["id"]
+        user_text = update["message"]["text"]
 
-set_telegram_webhook()
+        # Hier wird die Antwort logik / KI aufgerufen (Beispiel-Antwort)
+        reply_text = f"Hallo! Ich habe deine Nachricht erhalten: '{user_text}'"
+
+        # Nachricht an Telegram zurückschicken
+        send_url = f"https://api.telegram.org/bot{TELEGRAM_TOKEN}/sendMessage"
+        requests.post(send_url, json={"chat_id": chat_id, "text": reply_text})
+
+    return jsonify({"status": "ok"}), 200
+
+# 4. Status-Route zum Testen im Browser
+@app.route("/", methods=["GET"])
+def index():
+    return "Nexus KI Assistent Server läuft perfekt!", 200
 
 if __name__ == "__main__":
     port = int(os.environ.get("PORT", 10000))
