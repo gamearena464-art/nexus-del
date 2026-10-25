@@ -1565,7 +1565,7 @@ async def analyze_photo_with_gemini(client, image_prompt, image_part):
                         contents=[image_prompt, image_part],
                         config=types.GenerateContentConfig(
                             temperature=0.3,
-                            max_output_tokens=350,
+                            max_output_tokens=700,
                         ),
                     )
                 )
@@ -1602,9 +1602,6 @@ async def analyze_photo_with_gemini(client, image_prompt, image_part):
                 )
 
                 if not retryable:
-                    # Bei ungültigem Modell, Berechtigungsfehlern
-                    # oder einem ungültigen Schlüssel sofort zum
-                    # nächsten Modell wechseln.
                     break
 
                 if attempt + 1 < GEMINI_MAX_ATTEMPTS_PER_MODEL:
@@ -1724,25 +1721,51 @@ async def handle_photo(update: Update, context: ContextTypes.DEFAULT_TYPE):
         )
 
         photo_prompt = f"""
-Analysiere das angehängte Bild und antworte auf Deutsch.
+Analysiere das angehängte Bild sorgfältig und antworte auf Deutsch.
 
 Aufgabe des Nutzers:
 {caption}
 
+ZIEL:
+Erstelle eine ausführliche, informative und gut strukturierte Bildbeschreibung.
+Schreibe normalerweise ungefähr 180 bis 280 Wörter, sofern das Bild genügend
+erkennbare Informationen enthält. Beschränke dich nicht auf einen einzigen Satz.
+Wenn das Bild nur wenige Details zeigt, bleibe entsprechend kürzer und erfinde
+keine zusätzlichen Informationen.
+
+GLIEDERUNG:
+- Beginne mit einer passenden Überschrift und einem thematisch passenden Emoji.
+- **Gesamtbild:** Erkläre in 2 bis 4 Sätzen, was hauptsächlich zu sehen ist
+  und welche Situation oder Szene erkennbar ist.
+- **Wichtige Details:** Beschreibe mehrere konkrete Details zu sichtbaren
+  Personen, Tieren, Gegenständen, Farben, Formen, Kleidung, Oberflächen,
+  Symbolen oder anderen Merkmalen.
+- **Umgebung und Hintergrund:** Beschreibe den erkennbaren Ort, den Hintergrund,
+  die räumliche Anordnung und auffällige Elemente.
+- **Stimmung und Bildwirkung:** Beschreibe Beleuchtung, Farben, Perspektive,
+  Bildausschnitt und Stimmung. Kennzeichne Vermutungen als Vermutungen.
+- **Besonderheiten:** Nenne weitere auffällige Details, die zum Verständnis
+  des Bildes beitragen.
+- Bei einem Spiel-Screenshot: Erkläre sichtbare Spielinformationen, Symbole,
+  Statusanzeigen, Ziele oder Aufgaben. Schlage einen sinnvollen nächsten Schritt
+  vor, sofern die sichtbaren Informationen das zulassen.
+- Bei Text im Bild: Lies klar erkennbare Schrift möglichst genau ab und erkläre
+  kurz, was sie im Bildkontext bedeutet.
+- Wenn der Nutzer eine konkrete Frage stellt, beantworte sie zusätzlich direkt.
+
 FORMAT:
-- Beginne mit einer kurzen, passenden Überschrift und einem Emoji.
-- Beschreibe das Hauptmotiv in einem Satz.
-- Nenne die wichtigsten Details in höchstens 5 Stichpunkten.
-- Verwende passende Emojis für tatsächlich erkannte Dinge.
-- Schreibe kurze, gut lesbare Abschnitte mit Leerzeilen.
-- Vermeide unnötige Wiederholungen und lange Einleitungen.
-- Erfinde keine Details, die im Bild nicht erkennbar sind.
-- Bei einem Spiel-Screenshot: Erkläre kurz das Spielziel,
-  wichtige Elemente und gegebenenfalls einen sinnvollen nächsten Schritt.
-- Antworte normalerweise mit höchstens 120 Wörtern.
-- Wenn der Nutzer ausdrücklich eine ausführliche Analyse verlangt,
-  darf die Antwort länger sein.
-- Verwende Telegram-tauglichen Markdown-Fettdruck mit **Text**.
+- Verwende mehrere kurze Absätze und bei Bedarf 4 bis 8 aussagekräftige Stichpunkte.
+- Nutze Telegram-tauglichen Markdown-Fettdruck mit **Text**.
+- Verwende passende Emojis sparsam und sinnvoll.
+- Vermeide unnötige Einleitungen, Wiederholungen und leere Floskeln.
+
+WICHTIGE REGELN:
+- Beschreibe nur, was tatsächlich sichtbar oder zuverlässig lesbar ist.
+- Erfinde keine Namen, Identitäten, Ursachen, Handlungen oder Hintergrundgeschichten.
+- Wenn etwas nicht eindeutig erkennbar ist, sage ausdrücklich, dass es unklar ist.
+- Unterscheide klar zwischen sichtbaren Tatsachen und möglichen Interpretationen.
+- Behaupte nicht, die Absichten oder Gefühle einer Person sicher zu kennen.
+- Wenn das Bild unscharf oder teilweise verdeckt ist, erwähne die Einschränkung.
 """
 
         answer = await asyncio.wait_for(
