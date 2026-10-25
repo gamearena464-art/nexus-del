@@ -696,11 +696,49 @@ async def transcribe_voice(file_path):
     return getattr(transcription, "text", "").strip()
 
 
+def clean_markdown_for_speech(text):
+    """Entfernt Markdown-Zeichen, damit NEXUS sie nicht mit vorliest."""
+    if not text:
+        return ""
+
+    text = text.replace("\r\n", "\n").replace("\r", "\n")
+
+    # Codeblöcke und Inline-Code: den Inhalt behalten, die Markierungen entfernen.
+    text = re.sub(
+        r"```[a-zA-Z0-9_+-]*[ \t]*\n?(.*?)```",
+        r"\1",
+        text,
+        flags=re.S,
+    )
+    text = re.sub(r"`([^`]+)`", r"\1", text)
+
+    # Markdown-Überschriften und Trennlinien entfernen.
+    text = re.sub(r"(?m)^[ \t]{0,3}#{1,6}[ \t]*", "", text)
+    text = re.sub(r"(?m)^[ \t]*(?:---+|___+|\*\*\*+)[ \t]*$", "", text)
+
+    # Fett, kursiv und unterstrichen: Inhalt behalten.
+    text = re.sub(r"\*\*(.*?)\*\*", r"\1", text, flags=re.S)
+    text = re.sub(r"__(.*?)__", r"\1", text, flags=re.S)
+    text = re.sub(r"(?<!\*)\*([^*\n]+)\*(?!\*)", r"\1", text)
+    text = re.sub(r"(?<!_)_([^_\n]+)_(?!_)", r"\1", text)
+
+    # Listenmarker entfernen, der Text der Liste bleibt erhalten.
+    text = re.sub(r"(?m)^[ \t]*[-*+][ \t]+", "", text)
+    text = re.sub(r"(?m)^[ \t]*\d+[.)][ \t]+", "", text)
+
+    # Übrig gebliebene Markdown-Sternchen/Backticks nicht vorlesen.
+    text = text.replace("**", "").replace("*", "").replace("`", "")
+    text = re.sub(r"[ \t]+", " ", text)
+    text = re.sub(r"\n{3,}", "\n\n", text)
+    return text.strip()
+
+
 async def make_voice_file(text, path):
     try:
         import edge_tts
 
-        communicate = edge_tts.Communicate(text[:3000], EDGE_TTS_VOICE)
+        speech_text = clean_markdown_for_speech(text)
+        communicate = edge_tts.Communicate(speech_text[:3000], EDGE_TTS_VOICE)
         await communicate.save(path)
         return True
 
