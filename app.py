@@ -78,7 +78,10 @@ GEMINI_ATTEMPT_TIMEOUT = 45
 GEMINI_MAX_ATTEMPTS_PER_MODEL = 2
 GEMINI_ANALYSIS_TIMEOUT = 220
 
+# Maximale Ausgabelänge der Bildanalyse.
 GEMINI_PHOTO_MAX_OUTPUT_TOKENS = 1500
+
+# Wenn die erste Antwort kürzer ist, wird eine Erweiterung versucht.
 GEMINI_PHOTO_MIN_WORDS = 180
 GEMINI_PHOTO_TARGET_WORDS = 300
 
@@ -1329,6 +1332,25 @@ def is_farewell_phrase(text):
     return any(phrase in low for phrase in farewell_phrases)
 
 
+def is_greeting_phrase(text):
+    """Erkennt kurze, eigenständige Begrüßungen in Gruppenchats."""
+    low = re.sub(r"[!.,?…🙂😊👋]+", "", (text or "").lower()).strip()
+    greetings = {
+        "hallo", "hi", "hey", "servus", "moin", "grüß dich", "gruss dich",
+        "guten morgen", "guten tag", "guten abend", "hallöchen", "hallo nexus",
+        "hi nexus", "hey nexus", "moin nexus", "servus nexus",
+    }
+    return low in greetings
+
+
+def get_telegram_display_name(message):
+    """Liefert den Telegram-Anzeigenamen, nicht den @Benutzernamen oder die ID."""
+    user = message.from_user
+    if not user:
+        return None
+    return user.full_name or user.first_name or None
+
+
 def group_should_respond(chat_id, text, bot_username=""):
     now = asyncio.get_running_loop().time()
 
@@ -1364,6 +1386,25 @@ async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     if message.reply_to_message and message.reply_to_message.photo:
         replied_photo = message.reply_to_message
+
+    # Persönliche Begrüßung und Verabschiedung nur in Gruppen.
+    # Während der normalen Unterhaltung wird der Name nicht wiederholt.
+    if group:
+        display_name = get_telegram_display_name(message)
+
+        if is_greeting_phrase(text):
+            name = display_name or "du"
+            await message.reply_text(
+                f"Hallo {name}! 😊 Schön, dass du da bist. Wie kann ich dir helfen?"
+            )
+            return
+
+        if is_farewell_phrase(text):
+            name = display_name or "du"
+            await message.reply_text(
+                f"Mach's gut, {name}! 👋 Bis zum nächsten Mal!"
+            )
+            return
 
     image_request = extract_image_request(
         text,
