@@ -77,6 +77,13 @@ GEMINI_ATTEMPT_TIMEOUT = 35
 GEMINI_MAX_ATTEMPTS_PER_MODEL = 2
 GEMINI_ANALYSIS_TIMEOUT = 160
 
+# Höhere Ausgabegrenze für ausführliche Bildbeschreibungen.
+GEMINI_PHOTO_MAX_OUTPUT_TOKENS = 1400
+
+# Mindestlänge für eine normalerweise ausführliche Bildbeschreibung.
+# Bei sehr einfachen oder unklaren Bildern darf die Antwort kürzer sein.
+GEMINI_PHOTO_TARGET_WORDS = 300
+
 # ============================================================
 # AI HORDE — BILDER ERSTELLEN UND BEARBEITEN
 # ============================================================
@@ -138,8 +145,11 @@ FORMATIERUNG FÜR TELEGRAM:
 
 BESONDERS BEI BILDERN:
 - Beschreibe nur, was tatsächlich erkennbar ist.
-- Beginne mit einer kurzen Aussage zum Hauptmotiv.
-- Nenne anschließend die wichtigsten Details als Stichpunkte.
+- Wenn ein Bild zur Analyse geschickt wird, beschreibe es ausführlich,
+  sofern der Nutzer nicht ausdrücklich eine kurze Antwort verlangt.
+- Beschreibe das Hauptmotiv, sichtbare Details, Umgebung, Hintergrund,
+  Farben, Formen, Anordnung, Licht, Perspektive und Bildwirkung.
+- Nutze mehrere Absätze und aussagekräftige Stichpunkte.
 - Erfinde keine Details, die auf dem Bild nicht erkennbar sind.
 
 Wenn jemand fragt, wer dich programmiert oder erfunden hat,
@@ -1528,10 +1538,16 @@ def is_retryable_gemini_error(exc):
     )
 
 
+def count_words(text):
+    """Zählt Wörter für die Qualitätskontrolle der Bildbeschreibung."""
+    return len(re.findall(r"\b[\w'-]+\b", text or "", flags=re.UNICODE))
+
+
 async def analyze_photo_with_gemini(client, image_prompt, image_part):
     """
-    Probiert das Hauptmodell aus und wechselt bei Fehlern zum Ersatzmodell.
-    Jeder einzelne API-Aufruf hat sein eigenes Zeitlimit.
+    Analysiert das Foto mit dem Hauptmodell und wechselt bei Fehlern
+    zum Ersatzmodell. Kurze Antworten werden einmal mit einer klaren
+    Aufforderung zur Ergänzung erneut angefordert.
     """
 
     from google.genai import types
@@ -1550,6 +1566,8 @@ async def analyze_photo_with_gemini(client, image_prompt, image_part):
     last_error = None
 
     for model_index, model in enumerate(models):
+        # Pro Modell gibt es normale Versuche plus einen möglichen
+        # Ergänzungsversuch, wenn Gemini nur einen kurzen Satz liefert.
         for attempt in range(GEMINI_MAX_ATTEMPTS_PER_MODEL):
             try:
                 logger.info(
@@ -1564,8 +1582,8 @@ async def analyze_photo_with_gemini(client, image_prompt, image_part):
                         model=selected_model,
                         contents=[image_prompt, image_part],
                         config=types.GenerateContentConfig(
-                            temperature=0.3,
-                            max_output_tokens=700,
+                            temperature=0.35,
+                            max_output_tokens=GEMINI_PHOTO_MAX_OUTPUT_TOKENS,
                         ),
                     )
                 )
@@ -1576,17 +1594,76 @@ async def analyze_photo_with_gemini(client, image_prompt, image_part):
                 )
 
                 answer = getattr(result, "text", None)
+                answer = answer.strip() if answer else ""
 
-                if answer and answer.strip():
-                    logger.info(
-                        "Fotoanalyse erfolgreich mit Modell %s",
-                        model,
+                if not answer:
+                    raise RuntimeError(
+                        f"Gemini-Modell {model} hat keinen Text geliefert."
                     )
-                    return answer.strip()
 
-                raise RuntimeError(
-                    f"Gemini-Modell {model} hat keinen Text geliefert."
+                word_count = count_words(answer)
+
+                # Wenn die Antwort trotz des ausführlichen Prompts
+                # zu kurz ausfällt, fordern wir eine Erweiterung an.
+                if word_count < 180 and attempt + 1 < GEMINI_MAX_ATTEMPTS_PER_MODEL:
+                    logger.warning(
+                        "Fotoanalyse zu kurz (%s Wörter). "
+                        "Fordere eine ausführlichere Beschreibung an.",
+                        word_count,
+                    )
+
+                    expanded_prompt = (
+                        image_prompt
+                        + "\n\nWICHTIGE ERGÄNZUNG: Deine bisherige Antwort "
+                        "ist zu kurz. Analysiere das Bild erneut und "
+                        "liefere eine deutlich ausführlichere Beschreibung "
+                        "mit mindestens 250 Wörtern, soweit das Bild "
+                        "genügend erkennbare Informationen enthält. "
+                        "Beschreibe konkrete sichtbare Details, Farben, "
+                        "Formen, Positionen, Kleidung oder Gegenstände, "
+                        "Hintergrund, Umgebung, Beleuchtung, Perspektive "
+                        "und Bildwirkung. Nutze mehrere Absätze und "
+                        "8 bis 12 aussagekräftige Stichpunkte. Wiederhole "
+                        "nicht nur den ersten Satz. Erfinde nichts."
+                    )
+
+                    expanded_request = asyncio.to_thread(
+                        lambda selected_model=model: client.models.generate_content(
+                            model=selected_model,
+                            contents=[expanded_prompt, image_part],
+                            config=types.GenerateContentConfig(
+                                temperature=0.3,
+                                max_output_tokens=GEMINI_PHOTO_MAX_OUTPUT_TOKENS,
+                            ),
+                        )
+                    )
+
+                    expanded_result = await asyncio.wait_for(
+                        expanded_request,
+                        timeout=GEMINI_ATTEMPT_TIMEOUT,
+                    )
+
+                    expanded_answer = getattr(
+                        expanded_result, "text", None
+                    )
+                    expanded_answer = (
+                        expanded_answer.strip()
+                        if expanded_answer
+                        else ""
+                    )
+
+                    if expanded_answer and count_words(expanded_answer) > word_count:
+                        answer = expanded_answer
+                        word_count = count_words(answer)
+
+                logger.info(
+                    "Fotoanalyse erfolgreich mit Modell %s; "
+                    "Antwortlänge=%s Wörter",
+                    model,
+                    word_count,
                 )
+
+                return answer
 
             except Exception as exc:
                 last_error = exc
@@ -1602,6 +1679,8 @@ async def analyze_photo_with_gemini(client, image_prompt, image_part):
                 )
 
                 if not retryable:
+                    # Bei ungültigem Modell, Berechtigungsfehlern
+                    # oder ungültigem Schlüssel zum nächsten Modell.
                     break
 
                 if attempt + 1 < GEMINI_MAX_ATTEMPTS_PER_MODEL:
@@ -1677,7 +1756,7 @@ async def handle_photo(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     caption = (
         original_caption
-        or "Beschreibe dieses Bild auf Deutsch in einfachen Worten."
+        or "Beschreibe dieses Bild ausführlich auf Deutsch."
     )
 
     path = None
@@ -1721,51 +1800,78 @@ async def handle_photo(update: Update, context: ContextTypes.DEFAULT_TYPE):
         )
 
         photo_prompt = f"""
-Analysiere das angehängte Bild sorgfältig und antworte auf Deutsch.
+Du bist ein besonders sorgfältiger Bildanalyst. Untersuche das angehängte
+Bild genau und beschreibe es auf Deutsch ausführlich, konkret und gut lesbar.
 
-Aufgabe des Nutzers:
+AUFGABE DES NUTZERS:
 {caption}
 
 ZIEL:
-Erstelle eine ausführliche, informative und gut strukturierte Bildbeschreibung.
-Schreibe normalerweise ungefähr 180 bis 280 Wörter, sofern das Bild genügend
-erkennbare Informationen enthält. Beschränke dich nicht auf einen einzigen Satz.
-Wenn das Bild nur wenige Details zeigt, bleibe entsprechend kürzer und erfinde
-keine zusätzlichen Informationen.
+Erstelle normalerweise eine Beschreibung mit ungefähr 250 bis 450 Wörtern.
+Gib dich nicht mit einem einzigen Satz oder einer sehr kurzen Zusammenfassung
+zufrieden. Nutze die verfügbaren Ausgabetoken, um die tatsächlich sichtbaren
+Details verständlich zu erklären. Wenn das Bild nur wenige Informationen
+enthält, darf die Beschreibung kürzer sein; erfinde keinesfalls Details.
 
-GLIEDERUNG:
-- Beginne mit einer passenden Überschrift und einem thematisch passenden Emoji.
-- **Gesamtbild:** Erkläre in 2 bis 4 Sätzen, was hauptsächlich zu sehen ist
-  und welche Situation oder Szene erkennbar ist.
-- **Wichtige Details:** Beschreibe mehrere konkrete Details zu sichtbaren
-  Personen, Tieren, Gegenständen, Farben, Formen, Kleidung, Oberflächen,
-  Symbolen oder anderen Merkmalen.
-- **Umgebung und Hintergrund:** Beschreibe den erkennbaren Ort, den Hintergrund,
-  die räumliche Anordnung und auffällige Elemente.
-- **Stimmung und Bildwirkung:** Beschreibe Beleuchtung, Farben, Perspektive,
-  Bildausschnitt und Stimmung. Kennzeichne Vermutungen als Vermutungen.
-- **Besonderheiten:** Nenne weitere auffällige Details, die zum Verständnis
-  des Bildes beitragen.
-- Bei einem Spiel-Screenshot: Erkläre sichtbare Spielinformationen, Symbole,
-  Statusanzeigen, Ziele oder Aufgaben. Schlage einen sinnvollen nächsten Schritt
-  vor, sofern die sichtbaren Informationen das zulassen.
-- Bei Text im Bild: Lies klar erkennbare Schrift möglichst genau ab und erkläre
-  kurz, was sie im Bildkontext bedeutet.
-- Wenn der Nutzer eine konkrete Frage stellt, beantworte sie zusätzlich direkt.
+GLIEDERUNG DER ANTWORT:
 
-FORMAT:
-- Verwende mehrere kurze Absätze und bei Bedarf 4 bis 8 aussagekräftige Stichpunkte.
-- Nutze Telegram-tauglichen Markdown-Fettdruck mit **Text**.
-- Verwende passende Emojis sparsam und sinnvoll.
-- Vermeide unnötige Einleitungen, Wiederholungen und leere Floskeln.
+1. **Überschrift**
+   Beginne mit einer passenden Überschrift und einem thematisch passenden Emoji.
+
+2. **Gesamteindruck**
+   Beschreibe in 3 bis 5 vollständigen Sätzen, was hauptsächlich zu sehen ist.
+   Erkläre, wie die sichtbaren Elemente zusammenwirken und welche Handlung
+   oder Situation unmittelbar erkennbar ist.
+
+3. **Wichtige Bilddetails**
+   Nenne 8 bis 12 aussagekräftige Stichpunkte, sofern genügend Details
+   erkennbar sind. Berücksichtige beispielsweise:
+   - Personen oder Tiere und ihre sichtbaren Merkmale
+   - Kleidung, Körperhaltung und erkennbare Gesten
+   - Gegenstände und ihre Position im Bild
+   - Farben, Formen, Materialien und Oberflächen
+   - auffällige Symbole, Texte oder Beschriftungen
+   - Größenverhältnisse und räumliche Beziehungen
+   Beschreibe nur Merkmale, die tatsächlich sichtbar sind.
+
+4. **Umgebung und Hintergrund**
+   Beschreibe den Hintergrund, die Umgebung, die Anordnung der Elemente
+   und erkennbare Details im Vorder- oder Hintergrund.
+
+5. **Licht, Farben und Perspektive**
+   Erkläre die Beleuchtung, Schatten, Farbwirkung, Kameraperspektive und
+   Bildaufteilung, soweit diese Merkmale erkennbar sind.
+
+6. **Stimmung und Bildwirkung**
+   Beschreibe die Wirkung des Bildes. Kennzeichne Interpretationen ausdrücklich
+   als mögliche Eindrücke und nicht als sichere Tatsachen.
+
+7. **Besonderheiten**
+   Erwähne zusätzliche Details, die leicht übersehen werden könnten, aber
+   zum Verständnis des Bildes beitragen.
+
+8. **Bei Screenshots aus Spielen oder Programmen**
+   Erkläre sichtbare Spielobjekte, Figuren, Symbole, Statusanzeigen, Menüs,
+   Texte und erkennbare Ziele. Wenn ausreichend Informationen vorliegen,
+   nenne einen sinnvollen nächsten Schritt und erkläre kurz warum.
 
 WICHTIGE REGELN:
-- Beschreibe nur, was tatsächlich sichtbar oder zuverlässig lesbar ist.
-- Erfinde keine Namen, Identitäten, Ursachen, Handlungen oder Hintergrundgeschichten.
-- Wenn etwas nicht eindeutig erkennbar ist, sage ausdrücklich, dass es unklar ist.
-- Unterscheide klar zwischen sichtbaren Tatsachen und möglichen Interpretationen.
-- Behaupte nicht, die Absichten oder Gefühle einer Person sicher zu kennen.
-- Wenn das Bild unscharf oder teilweise verdeckt ist, erwähne die Einschränkung.
+- Schreibe mehrere Absätze. Gib nicht alles in einem einzigen Satz aus.
+- Verwende konkrete Beobachtungen statt allgemeiner Floskeln.
+- Vermeide Wiederholungen und leere Füllsätze.
+- Verwende Telegram-tauglichen Markdown-Fettdruck mit **Text**.
+- Setze Emojis sparsam und passend ein.
+- Erfinde keine Namen, Orte, Ursachen, Beziehungen oder Ereignisse.
+- Behaupte nicht, eine Person identifiziert zu haben.
+- Wenn ein Detail unklar ist, sage ausdrücklich, dass es nicht eindeutig
+  erkennbar ist.
+- Wenn der Nutzer eine konkrete Frage gestellt hat, beantworte sie direkt
+  und integriere die Antwort in die Beschreibung.
+- Eine kurze Antwort ist nur dann angemessen, wenn das Bild wirklich kaum
+  erkennbare Informationen enthält oder der Nutzer ausdrücklich Kürze verlangt.
+
+Liefere jetzt die fertige Bildbeschreibung und keine Erklärung über deine
+Vorgehensweise.
 """
 
         answer = await asyncio.wait_for(
@@ -1786,8 +1892,9 @@ WICHTIGE REGELN:
         await send_long_text(message, answer)
 
         logger.info(
-            "Fotoanalyse erfolgreich abgeschlossen; Chat=%s",
+            "Fotoanalyse erfolgreich abgeschlossen; Chat=%s; Wörter=%s",
             chat.id,
+            count_words(answer),
         )
 
     except Exception as exc:
