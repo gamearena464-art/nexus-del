@@ -1,3 +1,4 @@
+
 import os
 import re
 import html
@@ -65,7 +66,6 @@ GEMINI_API_KEY = os.getenv("GEMINI_API_KEY", "").strip()
 GEMINI_MODEL = os.getenv(
     "GEMINI_MODEL", "gemini-3.8-flash"
 ).strip()
-
 GEMINI_FALLBACK_MODEL = os.getenv(
     "GEMINI_FALLBACK_MODEL", "gemini-2.5-flash"
 ).strip()
@@ -77,6 +77,7 @@ GEMINI_FALLBACK_MODEL = os.getenv(
 GEMINI_ATTEMPT_TIMEOUT = 45
 GEMINI_MAX_ATTEMPTS_PER_MODEL = 2
 GEMINI_ANALYSIS_TIMEOUT = 220
+
 GEMINI_PHOTO_MAX_OUTPUT_TOKENS = 1500
 GEMINI_PHOTO_MIN_WORDS = 180
 GEMINI_PHOTO_TARGET_WORDS = 300
@@ -102,20 +103,18 @@ DATABASE_PATH = os.getenv(
 
 if not TELEGRAM_TOKEN:
     logger.warning("TELEGRAM_TOKEN fehlt.")
-
 if not GROQ_API_KEY:
     logger.warning("GROQ_API_KEY fehlt.")
-
 if not GEMINI_API_KEY:
     logger.warning("GEMINI_API_KEY fehlt; Fotoanalyse ist deaktiviert.")
-
 if not AI_HORDE_API_KEY:
     logger.warning("AI_HORDE_API_KEY fehlt; Bilderstellung ist deaktiviert.")
 
 groq_client = Groq(api_key=GROQ_API_KEY) if GROQ_API_KEY else None
 
 SYSTEM_PROMPT = """
-Du bist NEXUS, ein professioneller, freundlicher und intelligenter deutscher KI-Assistent.
+Du bist NEXUS, ein professioneller, freundlicher und intelligenter
+deutscher KI-Assistent.
 
 SPRACHE UND STIL:
 - Antworte grundsätzlich auf Deutsch, außer der Nutzer wünscht eine andere Sprache.
@@ -123,12 +122,11 @@ SPRACHE UND STIL:
 - Beantworte zuerst die eigentliche Frage.
 - Vermeide unnötige Einleitungen, Wiederholungen und überlange Erklärungen.
 - Erfinde keine Fakten. Weise ehrlich auf Unsicherheiten hin.
-- Verwende den Telegram-Profilnamen NICHT ständig in normalen Antworten.
-- Den Profilnamen nur verwenden, wenn du jemanden persönlich begrüßt oder verabschiedest.
-- Begrüße Nutzer nicht bei jeder einzelnen Nachricht erneut.
-- Berücksichtige persönliche Erinnerungen nur für den jeweiligen Nutzer.
-- Vermische niemals Erinnerungen verschiedener Personen in einer Gruppe.
-- Behaupte nicht, etwas dauerhaft gespeichert zu haben, wenn es nicht gespeichert wurde.
+- Verwende den Telegram-Profilnamen ausschließlich bei Begrüßungen
+  und Verabschiedungen. Verwende ihn nicht in normalen Antworten.
+- Erfrage nicht den Namen, wenn Telegram bereits einen Profilnamen liefert.
+- Behandle Informationen und Erinnerungen verschiedener Nutzer getrennt.
+- Übertrage persönliche Erinnerungen niemals auf andere Nutzer.
 
 FORMATIERUNG FÜR TELEGRAM:
 - Nutze kurze Absätze und ausreichend Leerzeilen.
@@ -145,8 +143,8 @@ BESONDERS BEI BILDERN:
 - Beschreibe nur, was tatsächlich erkennbar ist.
 - Wenn ein Bild zur Analyse geschickt wird, beschreibe es ausführlich,
   sofern der Nutzer nicht ausdrücklich eine kurze Antwort verlangt.
-- Beschreibe Hauptmotiv, sichtbare Details, Umgebung, Hintergrund,
-  Farben, Formen, Anordnung, Licht, Perspektive und Bildwirkung.
+- Beschreibe Hauptmotiv, Details, Umgebung, Hintergrund, Farben, Formen,
+  Anordnung, Licht, Perspektive und Bildwirkung.
 - Erfinde keine Details, die im Bild nicht erkennbar sind.
 
 Wenn jemand fragt, wer dich programmiert oder erfunden hat,
@@ -155,17 +153,42 @@ antworte: "Der liebe Heiko aus dem Schwabenländle. 😊"
 Sei jederzeit hilfreich, respektvoll und geduldig.
 """.strip()
 
-# Kurzzeitverlauf ist jetzt pro Chat UND Nutzer getrennt.
+# Der Verlauf wird pro Chat UND Telegram-Nutzer getrennt gespeichert.
 chat_history = defaultdict(list)
-
-# Aktivität der Gruppe bleibt pro Chat bestehen.
 group_active_until = {}
 
 MAX_HISTORY_MESSAGES = 12
 GROUP_ACTIVE_SECONDS = 180
+GREETING_INTERVAL_HOURS = 12
 
-# Nutzer werden nach 12 Stunden ohne Kontakt erneut begrüßt.
-GREETING_AFTER_HOURS = 12
+
+# ============================================================
+# NUTZERIDENTITÄT
+# ============================================================
+
+def get_user_id(update):
+    """Liefert die eindeutige Telegram-ID des Absenders."""
+    user = update.effective_user
+    return str(user.id) if user else "unknown"
+
+
+def get_display_name(update):
+    """Liefert den Profilnamen aus Telegram."""
+    user = update.effective_user
+
+    if not user:
+        return "du"
+
+    return (
+        (user.full_name or "").strip()
+        or (user.first_name or "").strip()
+        or "du"
+    )
+
+
+def get_session_key(chat_id, user_id):
+    """Eindeutiger Schlüssel für den Verlauf eines Nutzers."""
+    return f"{chat_id}:{user_id}"
 
 
 # ============================================================
@@ -184,29 +207,7 @@ def db_connect():
 def init_db():
     try:
         with db_connect() as conn:
-            # Alte Tabellen bleiben erhalten, damit bestehende Daten
-            # nicht beim Update gelöscht werden.
-            conn.execute("""
-                CREATE TABLE IF NOT EXISTS memories (
-                    chat_id TEXT NOT NULL,
-                    memory_key TEXT NOT NULL,
-                    memory_value TEXT NOT NULL,
-                    updated_at TEXT NOT NULL,
-                    PRIMARY KEY (chat_id, memory_key)
-                )
-            """)
-
-            conn.execute("""
-                CREATE TABLE IF NOT EXISTS conversation_log (
-                    id INTEGER PRIMARY KEY AUTOINCREMENT,
-                    chat_id TEXT NOT NULL,
-                    role TEXT NOT NULL,
-                    content TEXT NOT NULL,
-                    created_at TEXT NOT NULL
-                )
-            """)
-
-            # Neue Erinnerungen sind pro Chat und Telegram-Nutzer getrennt.
+            # Neue Tabellen: Erinnerungen sind pro Nutzer getrennt.
             conn.execute("""
                 CREATE TABLE IF NOT EXISTS user_memories (
                     chat_id TEXT NOT NULL,
@@ -214,7 +215,7 @@ def init_db():
                     memory_key TEXT NOT NULL,
                     memory_value TEXT NOT NULL,
                     updated_at TEXT NOT NULL,
-                    PRIMARY KEY (chat_id, user_id, memory_key, memory_value)
+                    PRIMARY KEY (chat_id, user_id, memory_key)
                 )
             """)
 
@@ -230,46 +231,65 @@ def init_db():
             """)
 
             conn.execute("""
+                CREATE INDEX IF NOT EXISTS idx_user_memories_updated
+                ON user_memories(chat_id, user_id, updated_at)
+            """)
+
+            conn.execute("""
+                CREATE INDEX IF NOT EXISTS idx_user_log_lookup
+                ON user_conversation_log(chat_id, user_id, created_at)
+            """)
+
+            conn.execute("""
                 CREATE TABLE IF NOT EXISTS user_sessions (
                     chat_id TEXT NOT NULL,
                     user_id TEXT NOT NULL,
-                    display_name TEXT NOT NULL DEFAULT '',
-                    last_seen TEXT NOT NULL,
+                    last_greeted_at TEXT,
                     PRIMARY KEY (chat_id, user_id)
                 )
             """)
+
+            # Alte Tabellen bleiben unangetastet, damit ein Update
+            # bestehende Daten nicht versehentlich löscht.
 
     except Exception:
         logger.exception("Datenbank konnte nicht initialisiert werden.")
 
 
 def save_memory(chat_id, user_id, key, value):
-    """Speichert eine Erinnerung für genau einen Nutzer in einem Chat."""
     try:
+        key = str(key).strip()[:100]
+        value = str(value).strip()[:1000]
+
+        if not key or not value:
+            return False
+
         with db_connect() as conn:
             conn.execute("""
                 INSERT INTO user_memories(
                     chat_id, user_id, memory_key, memory_value, updated_at
                 )
                 VALUES (?, ?, ?, ?, ?)
-                ON CONFLICT(chat_id, user_id, memory_key, memory_value)
-                DO UPDATE SET updated_at=excluded.updated_at
+                ON CONFLICT(chat_id, user_id, memory_key)
+                DO UPDATE SET
+                    memory_value=excluded.memory_value,
+                    updated_at=excluded.updated_at
             """, (
                 str(chat_id),
                 str(user_id),
-                str(key)[:100],
-                str(value)[:1000],
+                key,
+                value,
                 datetime.now(timezone.utc).isoformat(),
             ))
+
         return True
 
     except Exception:
-        logger.exception("Speichern der persönlichen Erinnerung fehlgeschlagen.")
+        logger.exception("Speichern der Erinnerung fehlgeschlagen.")
         return False
 
 
 def get_memories(chat_id, user_id, limit=30):
-    """Lädt ausschließlich Erinnerungen des betreffenden Nutzers."""
     try:
         with db_connect() as conn:
             rows = conn.execute("""
@@ -283,7 +303,7 @@ def get_memories(chat_id, user_id, limit=30):
         return rows
 
     except Exception:
-        logger.exception("Lesen der persönlichen Erinnerungen fehlgeschlagen.")
+        logger.exception("Lesen der Erinnerungen fehlgeschlagen.")
         return []
 
 
@@ -292,18 +312,19 @@ def forget_memory(chat_id, user_id, key):
         with db_connect() as conn:
             cur = conn.execute("""
                 DELETE FROM user_memories
-                WHERE chat_id=? AND user_id=?
-                  AND (memory_key LIKE ? OR memory_value LIKE ?)
+                WHERE chat_id=?
+                  AND user_id=?
+                  AND LOWER(memory_key) LIKE LOWER(?)
             """, (
                 str(chat_id),
                 str(user_id),
                 f"%{key}%",
-                f"%{key}%",
             ))
+
             return cur.rowcount
 
     except Exception:
-        logger.exception("Löschen der persönlichen Erinnerung fehlgeschlagen.")
+        logger.exception("Löschen der Erinnerung fehlgeschlagen.")
         return 0
 
 
@@ -324,105 +345,51 @@ def log_message(chat_id, user_id, role, content):
             ))
 
     except Exception:
-        logger.exception("Persönliches Nachrichtenprotokoll konnte nicht gespeichert werden.")
-
-
-def get_recent_logged_messages(chat_id, user_id, limit=MAX_HISTORY_MESSAGES):
-    """Lädt den letzten Gesprächsverlauf auch nach einem Neustart."""
-    try:
-        with db_connect() as conn:
-            rows = conn.execute("""
-                SELECT role, content
-                FROM user_conversation_log
-                WHERE chat_id=? AND user_id=?
-                ORDER BY id DESC
-                LIMIT ?
-            """, (str(chat_id), str(user_id), limit)).fetchall()
-
-        rows.reverse()
-        return [
-            {"role": role, "content": content}
-            for role, content in rows
-        ]
-
-    except Exception:
-        logger.exception("Laden des gespeicherten Gesprächsverlaufs fehlgeschlagen.")
-        return []
-
-
-def clear_user_history(chat_id, user_id):
-    """Setzt nur den Verlauf dieses Nutzers zurück, nicht seine Erinnerungen."""
-    try:
-        with db_connect() as conn:
-            conn.execute("""
-                DELETE FROM user_conversation_log
-                WHERE chat_id=? AND user_id=?
-            """, (str(chat_id), str(user_id)))
-        return True
-
-    except Exception:
-        logger.exception("Gesprächsverlauf konnte nicht zurückgesetzt werden.")
-        return False
-
-
-def get_display_name(update):
-    """Liefert den Namen aus dem Telegram-Profil."""
-    user = update.effective_user
-
-    if not user:
-        return "Freund"
-
-    name = (user.full_name or user.first_name or "").strip()
-    return name[:100] if name else "Freund"
+        logger.exception("Nachrichtenprotokoll konnte nicht gespeichert werden.")
 
 
 def should_greet_user(chat_id, user_id):
-    """Begrüßt einen Nutzer nur beim ersten Kontakt oder nach längerer Pause."""
+    """Begrüßt einen Nutzer beim ersten Kontakt oder nach zwölf Stunden."""
     try:
         with db_connect() as conn:
             row = conn.execute("""
-                SELECT last_seen
+                SELECT last_greeted_at
                 FROM user_sessions
                 WHERE chat_id=? AND user_id=?
             """, (str(chat_id), str(user_id))).fetchone()
 
-        if not row:
+        if not row or not row[0]:
             return True
 
-        last_seen = datetime.fromisoformat(row[0])
-        if last_seen.tzinfo is None:
-            last_seen = last_seen.replace(tzinfo=timezone.utc)
+        last_greeted = datetime.fromisoformat(row[0])
+
+        if last_greeted.tzinfo is None:
+            last_greeted = last_greeted.replace(tzinfo=timezone.utc)
 
         return (
-            datetime.now(timezone.utc) - last_seen
-            >= timedelta(hours=GREETING_AFTER_HOURS)
+            datetime.now(timezone.utc) - last_greeted
+            >= timedelta(hours=GREETING_INTERVAL_HOURS)
         )
 
     except Exception:
-        logger.exception("Nutzersitzung konnte nicht geprüft werden.")
+        logger.exception("Begrüßungsstatus konnte nicht gelesen werden.")
         return False
 
 
-def update_user_session(chat_id, user_id, display_name):
+def mark_greeted(chat_id, user_id):
     try:
+        now = datetime.now(timezone.utc).isoformat()
+
         with db_connect() as conn:
             conn.execute("""
-                INSERT INTO user_sessions(
-                    chat_id, user_id, display_name, last_seen
-                )
-                VALUES (?, ?, ?, ?)
+                INSERT INTO user_sessions(chat_id, user_id, last_greeted_at)
+                VALUES (?, ?, ?)
                 ON CONFLICT(chat_id, user_id)
-                DO UPDATE SET
-                    display_name=excluded.display_name,
-                    last_seen=excluded.last_seen
-            """, (
-                str(chat_id),
-                str(user_id),
-                str(display_name)[:100],
-                datetime.now(timezone.utc).isoformat(),
-            ))
+                DO UPDATE SET last_greeted_at=excluded.last_greeted_at
+            """, (str(chat_id), str(user_id), now))
+
     except Exception:
-        logger.exception("Nutzersitzung konnte nicht gespeichert werden.")
+        logger.exception("Begrüßungsstatus konnte nicht gespeichert werden.")
 
 
 def learn_from_text(chat_id, user_id, text):
@@ -456,7 +423,11 @@ def learn_from_text(chat_id, user_id, text):
 
 def markdown_to_telegram_html(text):
     """Konvertiert Markdown sicher für Telegram."""
-    text = ((text or "").replace("\r\n", "\n").replace("\r", "\n"))
+    text = (
+        (text or "")
+        .replace("\r\n", "\n")
+        .replace("\r", "\n")
+    )
 
     lines = text.split("\n")
     converted_lines = []
@@ -477,6 +448,7 @@ def markdown_to_telegram_html(text):
                     cell.strip()
                     for cell in line.strip().strip("|").split("|")
                 ]
+
                 i += 2
 
                 while i < len(lines) and lines[i].count("|") >= 2:
@@ -484,16 +456,19 @@ def markdown_to_telegram_html(text):
                         cell.strip()
                         for cell in lines[i].strip().strip("|").split("|")
                     ]
+
                     parts = []
 
                     for j, cell in enumerate(cells):
                         if not cell:
                             continue
+
                         label = headers[j] if j < len(headers) else ""
                         parts.append(f"{label}: {cell}" if label else cell)
 
                     if parts:
                         converted_lines.append("• " + " — ".join(parts))
+
                     i += 1
 
                 continue
@@ -517,7 +492,11 @@ def markdown_to_telegram_html(text):
     )
 
     text = html.escape(text, quote=False)
-    text = re.sub(r"(?m)^[ \t]*(?:---+|___+|\*\*\*+)[ \t]*$", "", text)
+    text = re.sub(
+        r"(?m)^[ \t]*(?:---+|___+|\*\*\*+)[ \t]*$",
+        "",
+        text,
+    )
     text = re.sub(
         r"(?m)^[ \t]{0,3}#{1,6}[ \t]*(.+?)[ \t]*#*[ \t]*$",
         r"<b>\1</b>",
@@ -536,7 +515,7 @@ def markdown_to_telegram_html(text):
 
 
 async def send_long_text(message, text, parse_mode=None):
-    """Teilt lange Antworten auf, ohne Leerzeilen zu verlieren."""
+    """Teilt lange Antworten auf."""
     text = (
         text or "Entschuldigung, ich habe gerade keine Antwort."
     ).replace("\r\n", "\n").replace("\r", "\n")
@@ -557,9 +536,7 @@ async def send_long_text(message, text, parse_mode=None):
 
         if remaining[split_at:split_at + 2] == "\n\n":
             split_at += 2
-        elif remaining[split_at:split_at + 1] == "\n":
-            split_at += 1
-        elif remaining[split_at:split_at + 1] == " ":
+        elif remaining[split_at:split_at + 1] in ("\n", " "):
             split_at += 1
 
         chunks.append(remaining[:split_at])
@@ -582,7 +559,7 @@ async def send_long_text(message, text, parse_mode=None):
 
 
 # ============================================================
-# KI-ANTWORTEN — GEDÄCHTNIS UND VERLAUF PRO PERSON
+# KI-ANTWORTEN — PRO NUTZER GETRENNT
 # ============================================================
 
 def get_ai_reply(chat_id, user_id, user_text):
@@ -597,26 +574,22 @@ def get_ai_reply(chat_id, user_id, user_text):
         f"- {key}: {value}" for key, value in memories
     )
 
-    # Verlauf dieses Nutzers im aktuellen Chat laden.
-    history_key = f"{chat_id}:{user_id}"
-    history = chat_history[history_key]
-
-    if not history:
-        history = get_recent_logged_messages(chat_id, user_id)
-
-    messages = [{"role": "system", "content": SYSTEM_PROMPT}]
+    messages = [
+        {"role": "system", "content": SYSTEM_PROMPT}
+    ]
 
     if memory_text:
         messages.append({
             "role": "system",
             "content": (
-                "Persönliche Erinnerungen ausschließlich für diesen Nutzer. "
-                "Nicht mit anderen Gruppenmitgliedern vermischen:\n"
+                "Persönliche Erinnerungen dieses Telegram-Nutzers. "
+                "Verwende diese Informationen nur für diesen Nutzer:\n"
                 + memory_text
             ),
         })
 
-    messages.extend(history[-MAX_HISTORY_MESSAGES:])
+    session_key = get_session_key(chat_id, user_id)
+    messages.extend(chat_history[session_key][-MAX_HISTORY_MESSAGES:])
     messages.append({"role": "user", "content": user_text})
 
     try:
@@ -632,12 +605,12 @@ def get_ai_reply(chat_id, user_id, user_text):
             or "Ich habe gerade keine Antwort."
         )
 
+        history = chat_history[session_key]
         history.extend([
             {"role": "user", "content": user_text[:3000]},
             {"role": "assistant", "content": answer[:3000]},
         ])
-
-        chat_history[history_key] = history[-MAX_HISTORY_MESSAGES:]
+        chat_history[session_key] = history[-MAX_HISTORY_MESSAGES:]
 
         log_message(chat_id, user_id, "user", user_text)
         log_message(chat_id, user_id, "assistant", answer)
@@ -660,8 +633,7 @@ def extract_image_request(text, has_source_image=False):
     if not text:
         return None
 
-    original = text.strip()
-    cleaned = re.sub(r"\s+", " ", original).strip()
+    cleaned = re.sub(r"\s+", " ", text.strip()).strip()
     low = cleaned.lower()
 
     edit_patterns = [
@@ -690,9 +662,7 @@ def extract_image_request(text, has_source_image=False):
 
     if has_source_image:
         if wants_edit or re.search(r"\b(bild|foto|fotoaufnahme)\b", low):
-            return "edit", cleaned or (
-                "Bearbeite das hochgeladene Bild und verbessere es kreativ."
-            )
+            return "edit", cleaned or "Bearbeite das hochgeladene Bild kreativ."
 
     elif wants_edit and re.search(r"\b(bild|foto|schrift|schriftzug)\b", low):
         if re.search(r"\b(?:neues|neu|neuen|neue)\s+bild\b", low):
@@ -708,13 +678,12 @@ def extract_image_request(text, has_source_image=False):
         r"\bkannst du\b.*\bbild\b",
         r"\bmach mir\b.*\bbild\b",
         r"\bgestalte mir\b.*\bbild\b",
-        r"\bzeichne mir\b", r"\bmale mir\b", r"\b/bild\b",
+        r"\bzeichne mir\b",
+        r"\bmale mir\b",
+        r"\b/bild\b",
     ]
 
-    if any(
-        re.search(pattern, low, flags=re.IGNORECASE)
-        for pattern in create_patterns
-    ):
+    if any(re.search(pattern, low, flags=re.IGNORECASE) for pattern in create_patterns):
         prompt = cleaned
 
         remove_patterns = [
@@ -847,8 +816,8 @@ def horde_status_sync(request_id):
 def horde_download_sync(image_url):
     response = requests.get(image_url, timeout=60)
     response.raise_for_status()
-    content_type = response.headers.get("content-type", "").lower()
 
+    content_type = response.headers.get("content-type", "").lower()
     if not content_type.startswith("image/"):
         raise RuntimeError("AI Horde hat keine gültige Bilddatei zurückgegeben.")
 
@@ -925,7 +894,6 @@ async def generate_horde_image(message, prompt, context, source_message=None):
 
             if status.get("faulted"):
                 raise RuntimeError("AI Horde konnte den Bildauftrag nicht ausführen.")
-
             if status.get("done"):
                 break
         else:
@@ -951,6 +919,7 @@ async def generate_horde_image(message, prompt, context, source_message=None):
         try:
             caption_prefix = "✅ Bearbeitetes Bild" if editing else "✅ Dein neues Bild"
             caption = f"{caption_prefix}\n\n{prompt[:850]}"
+
             with open(result_path, "rb") as photo:
                 await message.reply_photo(photo=photo, caption=caption)
         finally:
@@ -968,7 +937,6 @@ async def generate_horde_image(message, prompt, context, source_message=None):
             error_message = "⏳ AI Horde hat zu lange gebraucht. Bitte versuche es später erneut."
         elif isinstance(exc, requests.HTTPError):
             status_code = exc.response.status_code if exc.response is not None else None
-
             if status_code == 401:
                 error_message = "⚠️ AI Horde hat den API-Schlüssel abgelehnt. Bitte prüfe AI_HORDE_API_KEY in Render."
             elif status_code == 429:
@@ -991,48 +959,59 @@ async def generate_horde_image(message, prompt, context, source_message=None):
 # ============================================================
 
 async def start_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    message = update.effective_message
+    chat = update.effective_chat
+    user_id = get_user_id(update)
     name = get_display_name(update)
-    await update.effective_message.reply_text(
-        f"Hallo {name}! Ich bin NEXUS, dein KI-Assistent. 🤖😊\n\n"
-        "Du kannst mir einfach schreiben, was du möchtest.\n"
-        "Ich kann auch Bilder erstellen und hochgeladene Bilder bearbeiten.\n\n"
-        "Beispiele:\n"
-        "• Erstelle mir ein Bild von einem Schloss.\n"
-        "• Schreibe „Hallo“ in eleganter Schrift auf dieses Bild.\n"
-        "• Verwandle dieses Bild in eine Fantasy-Version.\n\n"
-        "Befehle:\n"
-        "/merken Text – etwas persönlich speichern\n"
-        "/gedaechtnis – deine Erinnerungen ansehen\n"
-        "/vergiss Text – eine Erinnerung löschen\n"
-        "/reset – deinen Chat-Verlauf zurücksetzen\n"
-        "/bild Beschreibung – neues Bild erstellen"
-    )
+
+    if message:
+        await message.reply_text(
+            f"Hallo {name}! Ich bin NEXUS, dein KI-Assistent. 🤖😊\n\n"
+            "Du kannst mir einfach schreiben, was du möchtest.\n"
+            "Ich kann auch Bilder erstellen und hochgeladene Bilder bearbeiten.\n\n"
+            "Beispiele:\n"
+            "• Erstelle mir ein Bild von einem Schloss.\n"
+            "• Schreibe „Hallo“ in eleganter Schrift auf dieses Bild.\n"
+            "• Verwandle dieses Bild in eine Fantasy-Version.\n\n"
+            "Befehle:\n"
+            "/merken Text – etwas speichern\n"
+            "/gedaechtnis – deine Erinnerungen ansehen\n"
+            "/vergiss Text – eine Erinnerung löschen\n"
+            "/reset – deinen kurzen Chat-Verlauf zurücksetzen\n"
+            "/bild Beschreibung – neues Bild erstellen"
+        )
+
+        if chat:
+            mark_greeted(chat.id, user_id)
 
 
 async def reset_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    chat = update.effective_chat
-    user = update.effective_user
+    chat_id = str(update.effective_chat.id)
+    user_id = get_user_id(update)
+    session_key = get_session_key(chat_id, user_id)
 
-    if not chat or not user:
-        return
+    # Nur den Verlauf des aktuellen Nutzers zurücksetzen.
+    chat_history.pop(session_key, None)
 
-    history_key = f"{chat.id}:{user.id}"
-    chat_history.pop(history_key, None)
-    clear_user_history(chat.id, user.id)
+    try:
+        with db_connect() as conn:
+            conn.execute("""
+                DELETE FROM user_conversation_log
+                WHERE chat_id=? AND user_id=?
+            """, (chat_id, user_id))
+    except Exception:
+        logger.exception("Gesprächsverlauf konnte nicht zurückgesetzt werden.")
 
     await update.effective_message.reply_text(
-        "Dein persönlicher Chat-Verlauf wurde zurückgesetzt. 🧹\n"
-        "Deine gespeicherten Erinnerungen bleiben erhalten."
+        "Dein kurzer Chat-Verlauf wurde zurückgesetzt. 🧹\n"
+        "Deine gespeicherten persönlichen Erinnerungen bleiben erhalten."
     )
 
 
 async def remember_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    chat = update.effective_chat
-    user = update.effective_user
+    chat_id = update.effective_chat.id
+    user_id = get_user_id(update)
     value = " ".join(context.args).strip()
-
-    if not chat or not user:
-        return
 
     if not value:
         await update.effective_message.reply_text(
@@ -1042,17 +1021,14 @@ async def remember_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return
 
     key = "Notiz"
-
     if ":" in value:
         possible_key, possible_value = value.split(":", 1)
         if possible_key.strip() and possible_value.strip():
             key = possible_key.strip()
             value = possible_value.strip()
 
-    if save_memory(chat.id, user.id, key, value):
-        await update.effective_message.reply_text(
-            f"Persönlich gespeichert! 🧠\n{key}: {value}"
-        )
+    if save_memory(chat_id, user_id, key, value):
+        await update.effective_message.reply_text(f"Gespeichert! 🧠\n{key}: {value}")
     else:
         await update.effective_message.reply_text(
             "Ich konnte das leider nicht speichern. Prüfe den Datenbankpfad in Render."
@@ -1060,33 +1036,22 @@ async def remember_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 
 async def memories_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    chat = update.effective_chat
-    user = update.effective_user
-
-    if not chat or not user:
-        return
-
-    memories = get_memories(chat.id, user.id)
+    memories = get_memories(update.effective_chat.id, get_user_id(update))
 
     if not memories:
         await update.effective_message.reply_text(
-            "Für dich habe ich hier noch keine persönlichen Erinnerungen gespeichert. 🧠"
+            "Ich habe für dich noch keine gespeicherten Erinnerungen. 🧠"
         )
         return
 
-    text = "🧠 Deine persönlichen Erinnerungen:\n" + "\n".join(
+    text = "🧠 Deine gespeicherten Erinnerungen:\n" + "\n".join(
         f"• {key}: {value}" for key, value in memories
     )
     await send_long_text(update.effective_message, text)
 
 
 async def forget_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    chat = update.effective_chat
-    user = update.effective_user
     key = " ".join(context.args).strip()
-
-    if not chat or not user:
-        return
 
     if not key:
         await update.effective_message.reply_text(
@@ -1094,13 +1059,17 @@ async def forget_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
         )
         return
 
-    count = forget_memory(chat.id, user.id, key)
+    count = forget_memory(
+        update.effective_chat.id,
+        get_user_id(update),
+        key,
+    )
 
     if count:
-        await update.effective_message.reply_text("Deine Erinnerung wurde gelöscht. 🧹")
+        await update.effective_message.reply_text("Deine passende Erinnerung wurde gelöscht. 🧹")
     else:
         await update.effective_message.reply_text(
-            "Ich habe dazu keine passende persönliche Erinnerung gefunden."
+            "Ich habe in deinen Erinnerungen nichts Passendes gefunden."
         )
 
 
@@ -1146,7 +1115,6 @@ async def transcribe_voice(file_path):
             )
 
     transcription = await asyncio.to_thread(transcribe)
-
     if isinstance(transcription, str):
         return transcription.strip()
 
@@ -1182,7 +1150,6 @@ async def make_voice_file(text, path):
         communicate = edge_tts.Communicate(speech_text[:3000], EDGE_TTS_VOICE)
         await communicate.save(path)
         return True
-
     except Exception:
         logger.exception("Sprachausgabe fehlgeschlagen.")
         return False
@@ -1247,14 +1214,14 @@ def is_farewell_phrase(text):
         "tschüss", "tschues", "tschüssi", "tschuess",
         "bye", "goodbye", "good bye", "ciao",
         "auf wiedersehen", "aufwiedersehen",
-        "bis später", "bis spaeter", "bis dann",
-        "bis bald", "gute nacht", "mach's gut", "mach’s gut",
+        "bis später", "bis spaeter", "bis dann", "bis bald",
+        "gute nacht", "mach's gut", "mach’s gut",
         "macht's gut", "macht’s gut", "ich muss los",
         "ich bin dann weg", "bin dann weg", "ich gehe jetzt",
         "ich geh jetzt", "schönen abend", "schoenen abend",
         "schönes wochenende", "schoenes wochenende",
-        "bis morgen", "bis zum nächsten mal",
-        "bis zum naechsten mal", "ich verabschiede mich",
+        "bis morgen", "bis zum nächsten mal", "bis zum naechsten mal",
+        "ich verabschiede mich",
     )
     return any(phrase in low for phrase in farewell_phrases)
 
@@ -1262,16 +1229,9 @@ def is_farewell_phrase(text):
 def group_should_respond(chat_id, text, bot_username=""):
     now = asyncio.get_running_loop().time()
 
-    if is_stop_phrase(text):
+    if is_stop_phrase(text) or is_farewell_phrase(text):
         group_active_until.pop(chat_id, None)
         return False
-
-    # Verabschiedungen werden in handle_text separat verarbeitet.
-    if is_farewell_phrase(text):
-        return (
-            is_addressed(text, bot_username)
-            or now < group_active_until.get(chat_id, 0)
-        )
 
     addressed = is_addressed(text, bot_username)
     active_until = group_active_until.get(chat_id, 0)
@@ -1284,15 +1244,13 @@ def group_should_respond(chat_id, text, bot_username=""):
     return False
 
 
-def greeting_prefix(chat_id, user_id, display_name):
-    """Erzeugt nur dann eine Begrüßung, wenn sie fällig ist."""
-    if should_greet_user(chat_id, user_id):
-        return f"Hallo {display_name}! 👋 Schön, dass du da bist.\n\n"
-    return ""
-
-
-def farewell_reply(display_name):
-    return f"Mach's gut, {display_name}! 😊 Bis zum nächsten Mal."
+def can_handle_group_farewell(chat_id, text, bot_username=""):
+    """Eine Verabschiedung in der Gruppe nur beantworten, wenn NEXUS gemeint ist
+    oder die Unterhaltung mit NEXUS noch aktiv ist."""
+    now = asyncio.get_running_loop().time()
+    active = now < group_active_until.get(chat_id, 0)
+    addressed = is_addressed(text, bot_username)
+    return active or addressed
 
 
 # ============================================================
@@ -1302,19 +1260,21 @@ def farewell_reply(display_name):
 async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
     message = update.effective_message
     chat = update.effective_chat
-    user = update.effective_user
 
-    if not message or not chat or not message.text or not user:
+    if not message or not chat or not message.text:
         return
 
     text = message.text.strip()
     group = is_group(chat.type)
-    display_name = get_display_name(update)
-    replied_photo = None
+    user_id = get_user_id(update)
+    name = get_display_name(update)
+    session_key = get_session_key(chat.id, user_id)
 
+    replied_photo = None
     if message.reply_to_message and message.reply_to_message.photo:
         replied_photo = message.reply_to_message
 
+    # Bildbearbeitung und Bilderstellung bleiben erhalten.
     image_request = extract_image_request(
         text,
         has_source_image=replied_photo is not None,
@@ -1349,37 +1309,45 @@ async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
             )
             return
 
-    # In Gruppen antwortet NEXUS nur, wenn er angesprochen wurde
+    # Begrüßung/Verabschiedung in privaten Chats.
+    # In Gruppen reagiert NEXUS darauf nur, wenn er gemeint ist
     # oder die Unterhaltung mit ihm noch aktiv ist.
-    if group and not group_should_respond(chat.id, text, context.bot.username or ""):
-        return
-
     if is_farewell_phrase(text):
-        answer = farewell_reply(display_name)
-        update_user_session(chat.id, user.id, display_name)
-        group_active_until.pop(chat.id, None)
-        await message.reply_text(answer)
+        if not group or can_handle_group_farewell(
+            chat.id, text, context.bot.username or ""
+        ):
+            group_active_until.pop(chat.id, None)
+            await message.reply_text(
+                f"Mach's gut, {name}! 😊 Bis zum nächsten Mal!"
+            )
         return
 
-    learned = learn_from_text(chat.id, user.id, text)
+    if is_stop_phrase(text):
+        if not group or is_addressed(text, context.bot.username or ""):
+            group_active_until.pop(chat.id, None)
+            await message.reply_text(f"Alles klar, {name if not group else 'ich'}! Ich bin jetzt still. 🤐")
+        return
 
+    if group and not group_should_respond(
+        chat.id, text, context.bot.username or ""
+    ):
+        return
+
+    # Nur begrüßen, wenn NEXUS tatsächlich auf die Nachricht reagiert.
+    if should_greet_user(chat.id, user_id):
+        await message.reply_text(f"Hallo {name}! Schön, dass du da bist. 😊")
+        mark_greeted(chat.id, user_id)
+
+    learned = learn_from_text(chat.id, user_id, text)
     if learned:
-        prefix = greeting_prefix(chat.id, user.id, display_name)
-        update_user_session(chat.id, user.id, display_name)
-        await message.reply_text(prefix + learned)
+        await message.reply_text(learned)
         return
 
     await message.chat.send_action("typing")
-    reply = await asyncio.to_thread(get_ai_reply, chat.id, user.id, text)
-
-    prefix = greeting_prefix(chat.id, user.id, display_name)
-    update_user_session(chat.id, user.id, display_name)
-
-    await send_reply_in_preferred_format(
-        message,
-        prefix + reply,
-        voice_reply=False,
+    reply = await asyncio.to_thread(
+        get_ai_reply, chat.id, user_id, text
     )
+    await send_reply_in_preferred_format(message, reply, voice_reply=False)
 
 
 # ============================================================
@@ -1389,13 +1357,13 @@ async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
 async def handle_voice(update: Update, context: ContextTypes.DEFAULT_TYPE):
     message = update.effective_message
     chat = update.effective_chat
-    user = update.effective_user
 
-    if not message or not chat or not message.voice or not user:
+    if not message or not chat or not message.voice:
         return
 
     group = is_group(chat.type)
-    display_name = get_display_name(update)
+    user_id = get_user_id(update)
+    name = get_display_name(update)
 
     if not groq_client:
         if not group:
@@ -1424,7 +1392,6 @@ async def handle_voice(update: Update, context: ContextTypes.DEFAULT_TYPE):
             return
 
         image_request = extract_image_request(spoken_text)
-
         if image_request:
             request_type, prompt = image_request
 
@@ -1443,49 +1410,37 @@ async def handle_voice(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 )
                 return
 
+        if is_farewell_phrase(spoken_text):
+            if not group or can_handle_group_farewell(
+                chat.id, spoken_text, context.bot.username or ""
+            ):
+                group_active_until.pop(chat.id, None)
+                await message.reply_text(f"Mach's gut, {name}! 😊 Bis zum nächsten Mal!")
+            return
+
         if group and not group_should_respond(
             chat.id, spoken_text, context.bot.username or ""
         ):
             return
 
-        if is_farewell_phrase(spoken_text):
-            update_user_session(chat.id, user.id, display_name)
-            group_active_until.pop(chat.id, None)
-            await send_reply_in_preferred_format(
-                message,
-                farewell_reply(display_name),
-                voice_reply=True,
-            )
-            return
+        if should_greet_user(chat.id, user_id):
+            await message.reply_text(f"Hallo {name}! Schön, dass du da bist. 😊")
+            mark_greeted(chat.id, user_id)
 
-        learned = learn_from_text(chat.id, user.id, spoken_text)
-
+        learned = learn_from_text(chat.id, user_id, spoken_text)
         if learned:
-            prefix = greeting_prefix(chat.id, user.id, display_name)
-            update_user_session(chat.id, user.id, display_name)
-            await send_reply_in_preferred_format(
-                message, prefix + learned, voice_reply=True
-            )
+            await message.reply_text(learned)
             return
 
         reply = await asyncio.to_thread(
-            get_ai_reply, chat.id, user.id, spoken_text
+            get_ai_reply, chat.id, user_id, spoken_text
         )
-
-        prefix = greeting_prefix(chat.id, user.id, display_name)
-        update_user_session(chat.id, user.id, display_name)
-
-        await send_reply_in_preferred_format(
-            message, prefix + reply, voice_reply=True
-        )
+        await send_reply_in_preferred_format(message, reply, voice_reply=True)
 
     except Exception:
         logger.exception("Verarbeitung der Sprachnachricht fehlgeschlagen.")
-
         if not group:
-            await message.reply_text(
-                "Beim Verarbeiten der Sprachnachricht ist ein Fehler passiert."
-            )
+            await message.reply_text("Beim Verarbeiten der Sprachnachricht ist ein Fehler passiert.")
 
     finally:
         if file_path:
@@ -1501,14 +1456,11 @@ async def handle_voice(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 def is_retryable_gemini_error(exc):
     error_text = str(exc).lower()
-    return any(
-        marker in error_text
-        for marker in (
-            "503", "unavailable", "high demand", "429",
-            "resource_exhausted", "500", "internal server error",
-            "502", "504", "deadline_exceeded", "timeout", "timed out",
-        )
-    )
+    return any(marker in error_text for marker in (
+        "503", "unavailable", "high demand", "429", "resource_exhausted",
+        "500", "internal server error", "502", "504",
+        "deadline_exceeded", "timeout", "timed out",
+    ))
 
 
 def count_words(text):
@@ -1546,40 +1498,28 @@ async def analyze_photo_with_gemini(client, image_prompt, image_part):
                         ),
                     )
                 )
-
-                result = await asyncio.wait_for(
-                    request, timeout=GEMINI_ATTEMPT_TIMEOUT
-                )
+                result = await asyncio.wait_for(request, timeout=GEMINI_ATTEMPT_TIMEOUT)
                 answer = getattr(result, "text", None)
                 answer = answer.strip() if answer else ""
 
                 if not answer:
-                    raise RuntimeError(
-                        f"Gemini-Modell {model} hat keinen Text geliefert."
-                    )
+                    raise RuntimeError(f"Gemini-Modell {model} hat keinen Text geliefert.")
 
                 word_count = count_words(answer)
 
-                if (
-                    word_count < GEMINI_PHOTO_MIN_WORDS
-                    and attempt + 1 < GEMINI_MAX_ATTEMPTS_PER_MODEL
-                ):
-                    logger.warning(
-                        "Fotoanalyse zu kurz (%s Wörter). Fordere eine ausführlichere Beschreibung an.",
-                        word_count,
-                    )
+                if word_count < GEMINI_PHOTO_MIN_WORDS and attempt + 1 < GEMINI_MAX_ATTEMPTS_PER_MODEL:
+                    logger.warning("Fotoanalyse zu kurz (%s Wörter).", word_count)
 
                     expanded_prompt = (
                         image_prompt
-                        + "\n\nWICHTIG: Die Antwort war zu kurz. Erstelle eine "
-                        "vollständige, deutlich ausführlichere Beschreibung. "
-                        "Verwende mehrere Überschriften, Absätze und 8 bis 12 "
-                        "konkrete Stichpunkte, soweit das Bild genug Details "
-                        "enthält. Beschreibe Hauptmotiv, Position, Merkmale, "
-                        "Gegenstände, Farben, Formen, Hintergrund, Umgebung, "
-                        "Beleuchtung, Schatten, Perspektive, Bildaufbau und "
-                        "Bildwirkung. Ziel sind ungefähr 300 Wörter. Erfinde "
-                        "keine Details."
+                        + "\n\nWICHTIG: Die Antwort war zu kurz. Erstelle eine neue, "
+                        "vollständige und deutlich ausführlichere Beschreibung. "
+                        "Verwende mehrere Überschriften, mehrere Absätze und 8 bis 12 "
+                        "konkrete Stichpunkte, soweit das Bild genug erkennbare Details "
+                        "enthält. Beschreibe Hauptmotiv, Position, Merkmale, Gegenstände, "
+                        "Farben, Formen, Hintergrund, Umgebung, Beleuchtung, Schatten, "
+                        "Perspektive, Bildaufbau und Bildwirkung. Ziel sind ungefähr "
+                        "300 Wörter. Wiederhole nicht nur den ersten Satz. Erfinde keine Details."
                     )
 
                     expanded_request = asyncio.to_thread(
@@ -1592,14 +1532,11 @@ async def analyze_photo_with_gemini(client, image_prompt, image_part):
                             ),
                         )
                     )
-
                     expanded_result = await asyncio.wait_for(
                         expanded_request, timeout=GEMINI_ATTEMPT_TIMEOUT
                     )
                     expanded_answer = getattr(expanded_result, "text", None)
-                    expanded_answer = (
-                        expanded_answer.strip() if expanded_answer else ""
-                    )
+                    expanded_answer = expanded_answer.strip() if expanded_answer else ""
 
                     if expanded_answer and count_words(expanded_answer) > word_count:
                         answer = expanded_answer
@@ -1656,13 +1593,11 @@ async def handle_photo(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     image_request = (
         extract_image_request(original_caption, has_source_image=True)
-        if original_caption
-        else None
+        if original_caption else None
     )
 
     if image_request:
         request_type, prompt = image_request
-
         if request_type in ("edit", "create"):
             await generate_horde_image(
                 message=message,
@@ -1711,8 +1646,8 @@ async def handle_photo(update: Update, context: ContextTypes.DEFAULT_TYPE):
         )
 
         photo_prompt = f"""
-Du bist ein sorgfältiger Bildanalyst. Untersuche das angehängte Bild
-genau und beschreibe es auf Deutsch ausführlich, konkret und gut lesbar.
+Du bist ein sorgfältiger Bildanalyst. Untersuche das angehängte Bild genau
+und beschreibe es auf Deutsch ausführlich, konkret und gut lesbar.
 
 AUFGABE DES NUTZERS:
 {caption}
@@ -1725,39 +1660,20 @@ tatsächlich nur wenige Informationen enthält, darf die Beschreibung kürzer
 sein. Erfinde keine Details.
 
 GLIEDERUNG:
-
-1. **Überschrift**
-   Beginne mit einer passenden Überschrift und einem passenden Emoji.
-
-2. **Gesamteindruck**
-   Beschreibe in 3 bis 5 vollständigen Sätzen, was hauptsächlich zu sehen ist.
-
-3. **Wichtige Bilddetails**
-   Nenne 8 bis 12 konkrete Stichpunkte, sofern ausreichend Details erkennbar sind.
-   Berücksichtige Personen oder Tiere, sichtbare Merkmale, Kleidung, Körperhaltung,
-   Gegenstände, Symbole, lesbare Texte, Farben, Formen, Materialien und Positionen.
-
-4. **Umgebung und Hintergrund**
-   Beschreibe Hintergrund sowie erkennbare Details im Vorder- und Hintergrund.
-
-5. **Licht, Farben und Perspektive**
-   Beschreibe Beleuchtung, Schatten, Farbwirkung, Perspektive und Bildaufbau.
-
-6. **Stimmung und Bildwirkung**
-   Erkläre den möglichen Eindruck. Trenne Eindrücke von erkennbaren Tatsachen.
-
-7. **Besonderheiten**
-   Erwähne zusätzliche Details, die leicht übersehen werden könnten.
-
-8. **Bei Spiel- oder Programm-Screenshots**
-   Erkläre sichtbare Figuren, Symbole, Statusanzeigen, Menüs, Texte und Ziele.
+1. **Überschrift** – Beginne mit einer passenden Überschrift und einem Emoji.
+2. **Gesamteindruck** – Beschreibe in 3 bis 5 vollständigen Sätzen, was zu sehen ist.
+3. **Wichtige Bilddetails** – Nenne 8 bis 12 konkrete Stichpunkte, sofern ausreichend Details erkennbar sind.
+4. **Umgebung und Hintergrund** – Beschreibe Hintergrund und Anordnung.
+5. **Licht, Farben und Perspektive** – Beschreibe Beleuchtung, Schatten und Bildaufbau.
+6. **Stimmung und Bildwirkung** – Trenne Eindrücke von erkennbaren Tatsachen.
+7. **Besonderheiten** – Erwähne Details, die leicht übersehen werden könnten.
+8. **Bei Spiel- oder Programm-Screenshots** – Erkläre sichtbare Figuren, Symbole, Anzeigen und Texte.
 
 WICHTIGE REGELN:
 - Schreibe mehrere Absätze und nicht nur einen Satz.
 - Verwende konkrete Beobachtungen statt allgemeiner Floskeln.
 - Vermeide Wiederholungen.
 - Verwende Telegram-tauglichen Markdown-Fettdruck mit **Text**.
-- Nutze Emojis sparsam und passend.
 - Erfinde keine Namen, Orte, Ursachen oder Beziehungen.
 - Behaupte nicht, eine Person identifiziert zu haben.
 - Wenn ein Detail unklar ist, sage ausdrücklich, dass es nicht eindeutig erkennbar ist.
@@ -1774,7 +1690,6 @@ WICHTIGE REGELN:
             answer = "⚠️ Ich konnte das Bild nicht zuverlässig beschreiben. Bitte versuche es erneut."
 
         await send_long_text(message, answer)
-
         logger.info(
             "Fotoanalyse erfolgreich abgeschlossen; Chat=%s; Wörter=%s",
             chat.id, count_words(answer),
@@ -1793,7 +1708,7 @@ WICHTIGE REGELN:
         elif "429" in error_text or "quota" in error_text or "rate limit" in error_text or "resource_exhausted" in error_text:
             user_message = "⚠️ Das Gemini-Limit oder die Anfragengrenze wurde erreicht. Bitte warte etwas und versuche es erneut."
         elif "503" in error_text or "unavailable" in error_text or "high demand" in error_text:
-            user_message = "⚠️ Gemini ist momentan stark ausgelastet. NEXUS hat Wiederholungsversuche und das konfigurierte Ersatzmodell ausprobiert. Bitte versuche es später erneut."
+            user_message = "⚠️ Gemini ist momentan stark ausgelastet. Wiederholungsversuche und Ersatzmodell sind fehlgeschlagen. Bitte versuche es später erneut."
         elif isinstance(exc, asyncio.TimeoutError) or "timeout" in error_text or "timed out" in error_text:
             user_message = "⏳ Die Fotoanalyse hat zu lange gedauert. Bitte versuche es erneut."
         else:
@@ -1852,9 +1767,7 @@ def build_application():
 
     application.add_handler(MessageHandler(filters.VOICE, handle_voice))
     application.add_handler(MessageHandler(filters.PHOTO, handle_photo))
-    application.add_handler(
-        MessageHandler(filters.TEXT & ~filters.COMMAND, handle_text)
-    )
+    application.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_text))
 
     application.add_error_handler(on_error)
     return application
