@@ -67,11 +67,16 @@ GEMINI_MODEL = os.getenv(
     "GEMINI_MODEL", "gemini-3.8-flash"
 ).strip()
 
-# Optionales Ersatzmodell für die Fotoanalyse.
-# In Render kann GEMINI_FALLBACK_MODEL gesetzt werden.
+# Ersatzmodell für die Fotoanalyse.
+# In Render kann GEMINI_FALLBACK_MODEL überschrieben werden.
 GEMINI_FALLBACK_MODEL = os.getenv(
-    "GEMINI_FALLBACK_MODEL", ""
+    "GEMINI_FALLBACK_MODEL", "gemini-2.5-flash"
 ).strip()
+
+# Zeitlimits für die Fotoanalyse
+GEMINI_ATTEMPT_TIMEOUT = 35
+GEMINI_MAX_ATTEMPTS_PER_MODEL = 2
+GEMINI_ANALYSIS_TIMEOUT = 160
 
 # ============================================================
 # AI HORDE — BILDER ERSTELLEN UND BEARBEITEN
@@ -369,7 +374,6 @@ def markdown_to_telegram_html(text):
                             continue
 
                         label = headers[j] if j < len(headers) else ""
-
                         parts.append(
                             f"{label}: {cell}" if label else cell
                         )
@@ -392,11 +396,7 @@ def markdown_to_telegram_html(text):
     def save_code_block(match):
         code = html.escape(match.group(2), quote=False)
         code_blocks.append(f"<pre>{code}</pre>")
-
-        return (
-            f"NEXUSCODEPLACEHOLDER"
-            f"{len(code_blocks) - 1}END"
-        )
+        return f"NEXUSCODEPLACEHOLDER{len(code_blocks) - 1}END"
 
     text = re.sub(
         r"```([a-zA-Z0-9_+-]*)[ \t]*\n?(.*?)```",
@@ -419,35 +419,11 @@ def markdown_to_telegram_html(text):
         text,
     )
 
-    text = re.sub(
-        r"`([^`\n]+)`",
-        r"<code>\1</code>",
-        text,
-    )
-
-    text = re.sub(
-        r"\*\*([^\n]+?)\*\*",
-        r"<b>\1</b>",
-        text,
-    )
-
-    text = re.sub(
-        r"__([^\n]+?)__",
-        r"<u>\1</u>",
-        text,
-    )
-
-    text = re.sub(
-        r"(?<!\*)\*([^*\n]+)\*(?!\*)",
-        r"<i>\1</i>",
-        text,
-    )
-
-    text = re.sub(
-        r"(?m)^[ \t]*[-*][ \t]+",
-        "• ",
-        text,
-    )
+    text = re.sub(r"`([^`\n]+)`", r"<code>\1</code>", text)
+    text = re.sub(r"\*\*([^\n]+?)\*\*", r"<b>\1</b>", text)
+    text = re.sub(r"__([^\n]+?)__", r"<u>\1</u>", text)
+    text = re.sub(r"(?<!\*)\*([^*\n]+)\*(?!\*)", r"<i>\1</i>", text)
+    text = re.sub(r"(?m)^[ \t]*[-*][ \t]+", "• ", text)
 
     for index, block in enumerate(code_blocks):
         text = text.replace(
@@ -533,10 +509,8 @@ def get_ai_reply(chat_id, user_text):
         )
 
     memories = get_memories(chat_id)
-
     memory_text = "\n".join(
-        f"- {key}: {value}"
-        for key, value in memories
+        f"- {key}: {value}" for key, value in memories
     )
 
     messages = [
@@ -555,11 +529,7 @@ def get_ai_reply(chat_id, user_text):
     messages.extend(
         chat_history[str(chat_id)][-MAX_HISTORY_MESSAGES:]
     )
-
-    messages.append({
-        "role": "user",
-        "content": user_text,
-    })
+    messages.append({"role": "user", "content": user_text})
 
     try:
         result = groq_client.chat.completions.create(
@@ -575,21 +545,11 @@ def get_ai_reply(chat_id, user_text):
         )
 
         history = chat_history[str(chat_id)]
-
         history.extend([
-            {
-                "role": "user",
-                "content": user_text[:3000],
-            },
-            {
-                "role": "assistant",
-                "content": answer[:3000],
-            },
+            {"role": "user", "content": user_text[:3000]},
+            {"role": "assistant", "content": answer[:3000]},
         ])
-
-        chat_history[str(chat_id)] = history[
-            -MAX_HISTORY_MESSAGES:
-        ]
+        chat_history[str(chat_id)] = history[-MAX_HISTORY_MESSAGES:]
 
         log_message(chat_id, "user", user_text)
         log_message(chat_id, "assistant", answer)
@@ -598,7 +558,6 @@ def get_ai_reply(chat_id, user_text):
 
     except Exception:
         logger.exception("Groq-Anfrage fehlgeschlagen.")
-
         return (
             "Ups, meine KI hat gerade ein Problem. "
             "Bitte prüfe GROQ_API_KEY und GROQ_MODEL in Render."
@@ -610,15 +569,6 @@ def get_ai_reply(chat_id, user_text):
 # ============================================================
 
 def extract_image_request(text, has_source_image=False):
-    """
-    Erkennt natürlich formulierte Bildwünsche.
-
-    Rückgabe:
-        ("create", prompt) = neues Bild erstellen
-        ("edit", prompt)   = vorhandenes Bild bearbeiten
-        None               = kein Bildwunsch
-    """
-
     if not text:
         return None
 
@@ -661,33 +611,21 @@ def extract_image_request(text, has_source_image=False):
     )
 
     if has_source_image:
-        if wants_edit or re.search(
-            r"\b(bild|foto|fotoaufnahme)\b",
-            low,
-        ):
-            prompt = cleaned
-
-            if not prompt:
-                prompt = (
-                    "Bearbeite das hochgeladene Bild "
-                    "und verbessere es kreativ."
-                )
-
+        if wants_edit or re.search(r"\b(bild|foto|fotoaufnahme)\b", low):
+            prompt = cleaned or (
+                "Bearbeite das hochgeladene Bild "
+                "und verbessere es kreativ."
+            )
             return "edit", prompt
 
     elif wants_edit and re.search(
-        r"\b(bild|foto|schrift|schriftzug)\b",
-        low,
+        r"\b(bild|foto|schrift|schriftzug)\b", low
     ):
-        if re.search(
-            r"\b(?:neues|neu|neuen|neue)\s+bild\b",
-            low,
-        ):
+        if re.search(r"\b(?:neues|neu|neuen|neue)\s+bild\b", low):
             return "create", cleaned
 
     create_patterns = [
-        r"\b(?:erstelle|erstell|generiere|zeichne|male|"
-        r"erzeuge|mach|mache)\b.*\bbild\b",
+        r"\b(?:erstelle|erstell|generiere|zeichne|male|erzeuge|mach|mache)\b.*\bbild\b",
         r"\bich möchte\b.*\bbild\b",
         r"\bich moechte\b.*\bbild\b",
         r"\bich will\b.*\bbild\b",
@@ -711,12 +649,10 @@ def extract_image_request(text, has_source_image=False):
 
         remove_patterns = [
             r"^(?:nexus[,!: ]*)?",
-            r"^(?:ich möchte|ich moechte|ich will)\s*,?\s*"
-            r"(?:dass\s+du\s+)?",
+            r"^(?:ich möchte|ich moechte|ich will)\s*,?\s*(?:dass\s+du\s+)?",
             r"^(?:kannst du|könntest du|koenntest du)\s+",
             r"^(?:bitte\s+)?",
-            r"^(?:erstelle|erstell|generiere|erzeuge|zeichne|male)"
-            r"(?:\s+mir)?\s+",
+            r"^(?:erstelle|erstell|generiere|erzeuge|zeichne|male)(?:\s+mir)?\s+",
             r"^(?:mach|mache)\s+(?:mir\s+)?",
             r"^(?:ein|eine|einen)\s+bild\s+",
             r"^(?:ein|eine|einen)\s+bild\s+(?:von|mit)\s+",
@@ -724,10 +660,7 @@ def extract_image_request(text, has_source_image=False):
 
         for pattern in remove_patterns:
             prompt = re.sub(
-                pattern,
-                "",
-                prompt,
-                flags=re.IGNORECASE,
+                pattern, "", prompt, flags=re.IGNORECASE
             ).strip()
 
         prompt = re.sub(
@@ -742,11 +675,7 @@ def extract_image_request(text, has_source_image=False):
 
         return "create", prompt
 
-    if re.search(
-        r"\b(?:ein|eine|einen)\s+bild\s+"
-        r"(?:von|mit)\s+",
-        low,
-    ):
+    if re.search(r"\b(?:ein|eine|einen)\s+bild\s+(?:von|mit)\s+", low):
         return "create", cleaned
 
     return None
@@ -756,12 +685,7 @@ def extract_image_request(text, has_source_image=False):
 # BILDER FÜR AI HORDE VORBEREITEN
 # ============================================================
 
-async def telegram_photo_to_horde_base64(
-    photo_message,
-    context,
-):
-    """Lädt ein Telegram-Foto herunter und wandelt es in WebP um."""
-
+async def telegram_photo_to_horde_base64(photo_message, context):
     if not photo_message or not photo_message.photo:
         raise ValueError(
             "Es wurde kein verwendbares Telegram-Foto gefunden."
@@ -784,8 +708,7 @@ async def telegram_photo_to_horde_base64(
 
     try:
         with tempfile.NamedTemporaryFile(
-            suffix=".jpg",
-            delete=False,
+            suffix=".jpg", delete=False
         ) as tmp:
             temp_input = tmp.name
 
@@ -796,8 +719,7 @@ async def telegram_photo_to_horde_base64(
             image.thumbnail((1536, 1536))
 
             with tempfile.NamedTemporaryFile(
-                suffix=".webp",
-                delete=False,
+                suffix=".webp", delete=False
             ) as tmp:
                 temp_output = tmp.name
 
@@ -871,16 +793,10 @@ def horde_status_sync(request_id):
 
 
 def horde_download_sync(image_url):
-    response = requests.get(
-        image_url,
-        timeout=60,
-    )
+    response = requests.get(image_url, timeout=60)
     response.raise_for_status()
 
-    content_type = response.headers.get(
-        "content-type",
-        "",
-    ).lower()
+    content_type = response.headers.get("content-type", "").lower()
 
     if not content_type.startswith("image/"):
         raise RuntimeError(
@@ -896,12 +812,9 @@ async def generate_horde_image(
     context,
     source_message=None,
 ):
-    """Erstellt ein neues Bild oder bearbeitet ein vorhandenes Foto."""
-
     if not AI_HORDE_API_KEY:
         await message.reply_text(
-            "⚠️ Für die Bilderstellung fehlt "
-            "AI_HORDE_API_KEY in Render."
+            "⚠️ Für die Bilderstellung fehlt AI_HORDE_API_KEY in Render."
         )
         return
 
@@ -924,8 +837,7 @@ async def generate_horde_image(
             )
 
             source_image = await telegram_photo_to_horde_base64(
-                source_message,
-                context,
+                source_message, context
             )
 
             full_prompt = (
@@ -933,11 +845,9 @@ async def generate_horde_image(
                 "following user instructions. Preserve the main "
                 "subject and important composition where possible. "
                 "Make only the requested changes and produce a "
-                "coherent, high-quality image. "
-                "User instructions: "
+                "coherent, high-quality image. User instructions: "
                 + prompt
             )
-
         else:
             await message.reply_text(
                 "🎨 Ich erstelle dein Bild. "
@@ -970,10 +880,8 @@ async def generate_horde_image(
             payload["params"]["denoising_strength"] = 0.55
 
         response_data = await asyncio.to_thread(
-            horde_submit_sync,
-            payload,
+            horde_submit_sync, payload
         )
-
         request_id = response_data.get("id")
 
         if not request_id:
@@ -999,8 +907,7 @@ async def generate_horde_image(
             await asyncio.sleep(5)
 
             status = await asyncio.to_thread(
-                horde_check_sync,
-                request_id,
+                horde_check_sync, request_id
             )
 
             if status.get("faulted"):
@@ -1010,7 +917,6 @@ async def generate_horde_image(
 
             if status.get("done"):
                 break
-
         else:
             raise TimeoutError(
                 "AI Horde hat innerhalb der erlaubten Wartezeit "
@@ -1018,10 +924,8 @@ async def generate_horde_image(
             )
 
         result_data = await asyncio.to_thread(
-            horde_status_sync,
-            request_id,
+            horde_status_sync, request_id
         )
-
         generations = result_data.get("generations") or []
 
         if not generations:
@@ -1030,8 +934,7 @@ async def generate_horde_image(
                 "hat aber kein Bild zurückgegeben."
             )
 
-        generation = generations[0]
-        image_url = generation.get("img")
+        image_url = generations[0].get("img")
 
         if not image_url:
             raise RuntimeError(
@@ -1039,15 +942,13 @@ async def generate_horde_image(
             )
 
         image_bytes, content_type = await asyncio.to_thread(
-            horde_download_sync,
-            image_url,
+            horde_download_sync, image_url
         )
 
         suffix = ".webp" if "webp" in content_type else ".png"
 
         with tempfile.NamedTemporaryFile(
-            suffix=suffix,
-            delete=False,
+            suffix=suffix, delete=False
         ) as tmp:
             tmp.write(image_bytes)
             result_path = tmp.name
@@ -1058,7 +959,6 @@ async def generate_horde_image(
                 if editing
                 else "✅ Dein neues Bild"
             )
-
             caption = f"{caption_prefix}\n\n{prompt[:850]}"
 
             with open(result_path, "rb") as photo:
@@ -1066,7 +966,6 @@ async def generate_horde_image(
                     photo=photo,
                     caption=caption,
                 )
-
         finally:
             try:
                 os.remove(result_path)
@@ -1088,7 +987,6 @@ async def generate_horde_image(
                 "⏳ AI Horde hat zu lange gebraucht. "
                 "Bitte versuche es später erneut."
             )
-
         elif isinstance(exc, requests.HTTPError):
             status_code = (
                 exc.response.status_code
@@ -1112,14 +1010,12 @@ async def generate_horde_image(
                     f"⚠️ AI Horde meldet HTTP {status_code}. "
                     "Bitte prüfe die Render Runtime Logs."
                 )
-
         elif "Pillow" in str(exc):
             error_message = (
                 "⚠️ Für die Bearbeitung fehlt Pillow. "
                 "Füge 'Pillow' zu requirements.txt hinzu "
                 "und starte Render neu."
             )
-
         else:
             error_message = (
                 "⚠️ Das Bild konnte gerade nicht erstellt "
@@ -1135,15 +1031,11 @@ async def generate_horde_image(
 # TELEGRAM-BEFEHLE
 # ============================================================
 
-async def start_command(
-    update: Update,
-    context: ContextTypes.DEFAULT_TYPE,
-):
+async def start_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.effective_message.reply_text(
         "Hallo! Ich bin NEXUS, dein KI-Assistent. 🤖😊\n\n"
         "Du kannst mir einfach schreiben, was du möchtest.\n"
-        "Ich kann auch Bilder erstellen und hochgeladene Bilder "
-        "bearbeiten.\n\n"
+        "Ich kann auch Bilder erstellen und hochgeladene Bilder bearbeiten.\n\n"
         "Beispiele:\n"
         "• Erstelle mir ein Bild von einem Schloss.\n"
         "• Schreibe „Hallo“ in eleganter Schrift auf dieses Bild.\n"
@@ -1157,10 +1049,7 @@ async def start_command(
     )
 
 
-async def reset_command(
-    update: Update,
-    context: ContextTypes.DEFAULT_TYPE,
-):
+async def reset_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     chat_id = str(update.effective_chat.id)
     chat_history.pop(chat_id, None)
 
@@ -1170,10 +1059,7 @@ async def reset_command(
     )
 
 
-async def remember_command(
-    update: Update,
-    context: ContextTypes.DEFAULT_TYPE,
-):
+async def remember_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     chat_id = update.effective_chat.id
     value = " ".join(context.args).strip()
 
@@ -1188,7 +1074,6 @@ async def remember_command(
 
     if ":" in value:
         possible_key, possible_value = value.split(":", 1)
-
         if possible_key.strip() and possible_value.strip():
             key = possible_key.strip()
             value = possible_value.strip()
@@ -1204,10 +1089,7 @@ async def remember_command(
         )
 
 
-async def memories_command(
-    update: Update,
-    context: ContextTypes.DEFAULT_TYPE,
-):
+async def memories_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     memories = get_memories(update.effective_chat.id)
 
     if not memories:
@@ -1217,17 +1099,12 @@ async def memories_command(
         return
 
     text = "🧠 Das habe ich gespeichert:\n" + "\n".join(
-        f"• {key}: {value}"
-        for key, value in memories
+        f"• {key}: {value}" for key, value in memories
     )
-
     await send_long_text(update.effective_message, text)
 
 
-async def forget_command(
-    update: Update,
-    context: ContextTypes.DEFAULT_TYPE,
-):
+async def forget_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     key = " ".join(context.args).strip()
 
     if not key:
@@ -1237,10 +1114,7 @@ async def forget_command(
         )
         return
 
-    count = forget_memory(
-        update.effective_chat.id,
-        key,
-    )
+    count = forget_memory(update.effective_chat.id, key)
 
     if count:
         await update.effective_message.reply_text(
@@ -1256,10 +1130,7 @@ async def forget_command(
 # /BILD — NEUES BILD ERSTELLEN
 # ============================================================
 
-async def image_command(
-    update: Update,
-    context: ContextTypes.DEFAULT_TYPE,
-):
+async def image_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     message = update.effective_message
     prompt = " ".join(context.args).strip()
 
@@ -1308,45 +1179,33 @@ async def transcribe_voice(file_path):
 
 
 def clean_markdown_for_speech(text):
-    """Entfernt Markdown-Zeichen für die Sprachausgabe."""
-
     if not text:
         return ""
 
     text = text.replace("\r\n", "\n").replace("\r", "\n")
-
     text = re.sub(
         r"```[a-zA-Z0-9_+-]*[ \t]*\n?(.*?)```",
         r"\1",
         text,
         flags=re.S,
     )
-
     text = re.sub(r"`([^`]+)`", r"\1", text)
     text = re.sub(
         r"(?m)^[ \t]{0,3}#{1,6}[ \t]*",
         "",
         text,
     )
-
     text = re.sub(
         r"(?m)^[ \t]*(?:---+|___+|\*\*\*+)[ \t]*$",
         "",
         text,
     )
-
     text = re.sub(r"\*\*(.*?)\*\*", r"\1", text, flags=re.S)
     text = re.sub(r"__(.*?)__", r"\1", text, flags=re.S)
-    text = re.sub(
-        r"(?<!\*)\*([^*\n]+)\*(?!\*)",
-        r"\1",
-        text,
-    )
-
+    text = re.sub(r"(?<!\*)\*([^*\n]+)\*(?!\*)", r"\1", text)
     text = re.sub(r"(?<!_)_([^_\n]+)_(?!_)", r"\1", text)
     text = re.sub(r"(?m)^[ \t]*[-*+][ \t]+", "", text)
     text = re.sub(r"(?m)^[ \t]*\d+[.)][ \t]+", "", text)
-
     text = text.replace("**", "").replace("*", "").replace("`", "")
     text = re.sub(r"[ \t]+", " ", text)
     text = re.sub(r"\n{3,}", "\n\n", text)
@@ -1359,12 +1218,10 @@ async def make_voice_file(text, path):
         import edge_tts
 
         speech_text = clean_markdown_for_speech(text)
-
         communicate = edge_tts.Communicate(
             speech_text[:3000],
             EDGE_TTS_VOICE,
         )
-
         await communicate.save(path)
         return True
 
@@ -1373,15 +1230,10 @@ async def make_voice_file(text, path):
         return False
 
 
-async def send_reply_in_preferred_format(
-    message,
-    text,
-    voice_reply=False,
-):
+async def send_reply_in_preferred_format(message, text, voice_reply=False):
     if voice_reply:
         with tempfile.NamedTemporaryFile(
-            suffix=".mp3",
-            delete=False,
+            suffix=".mp3", delete=False
         ) as tmp:
             voice_path = tmp.name
 
@@ -1389,9 +1241,7 @@ async def send_reply_in_preferred_format(
             if await make_voice_file(text, voice_path):
                 with open(voice_path, "rb") as audio:
                     await message.reply_voice(voice=audio)
-
                 return
-
         finally:
             try:
                 os.remove(voice_path)
@@ -1406,10 +1256,7 @@ async def send_reply_in_preferred_format(
 # ============================================================
 
 def is_group(chat_type):
-    return chat_type in (
-        ChatType.GROUP,
-        ChatType.SUPERGROUP,
-    )
+    return chat_type in (ChatType.GROUP, ChatType.SUPERGROUP)
 
 
 def is_addressed(text, bot_username=""):
@@ -1420,10 +1267,7 @@ def is_addressed(text, bot_username=""):
         return True
 
     return bool(
-        re.search(
-            r"\b(nexus|ki-assistent|ki assistent|bot)\b",
-            low,
-        )
+        re.search(r"\b(nexus|ki-assistent|ki assistent|bot)\b", low)
     )
 
 
@@ -1434,24 +1278,13 @@ def is_stop_phrase(text):
         return True
 
     stop_phrases = (
-        "nexus aus",
-        "nexus stopp",
-        "stopp nexus",
-        "stop nexus",
-        "ruhe nexus",
-        "tschüss nexus",
-        "tschues nexus",
-        "auf wiedersehen nexus",
-        "geh offline",
-        "sei still nexus",
-        "nexus schlaf",
-        "nexus sei still",
+        "nexus aus", "nexus stopp", "stopp nexus", "stop nexus",
+        "ruhe nexus", "tschüss nexus", "tschues nexus",
+        "auf wiedersehen nexus", "geh offline", "sei still nexus",
+        "nexus schlaf", "nexus sei still",
     )
 
-    return any(
-        phrase in low
-        for phrase in stop_phrases
-    )
+    return any(phrase in low for phrase in stop_phrases)
 
 
 def is_farewell_phrase(text):
@@ -1463,24 +1296,18 @@ def is_farewell_phrase(text):
         "auf wiedersehen", "aufwiedersehen",
         "bis später", "bis spaeter", "bis dann",
         "bis bald", "gute nacht", "mach's gut", "mach’s gut",
-        "macht's gut", "macht’s gut",
-        "ich muss los", "ich bin dann weg", "bin dann weg",
-        "ich gehe jetzt", "ich geh jetzt",
-        "schönen abend", "schoenen abend",
+        "macht's gut", "macht’s gut", "ich muss los",
+        "ich bin dann weg", "bin dann weg", "ich gehe jetzt",
+        "ich geh jetzt", "schönen abend", "schoenen abend",
         "schönes wochenende", "schoenes wochenende",
         "bis morgen", "bis zum nächsten mal",
         "bis zum naechsten mal", "ich verabschiede mich",
     )
 
-    return any(
-        phrase in low
-        for phrase in farewell_phrases
-    )
+    return any(phrase in low for phrase in farewell_phrases)
 
 
 def group_should_respond(chat_id, text, bot_username=""):
-    """Steuert normale Antworten in Gruppen."""
-
     now = asyncio.get_running_loop().time()
 
     if is_stop_phrase(text) or is_farewell_phrase(text):
@@ -1491,9 +1318,7 @@ def group_should_respond(chat_id, text, bot_username=""):
     active_until = group_active_until.get(chat_id, 0)
 
     if addressed or now < active_until:
-        group_active_until[chat_id] = (
-            now + GROUP_ACTIVE_SECONDS
-        )
+        group_active_until[chat_id] = now + GROUP_ACTIVE_SECONDS
         return True
 
     group_active_until.pop(chat_id, None)
@@ -1504,10 +1329,7 @@ def group_should_respond(chat_id, text, bot_username=""):
 # TEXTNACHRICHTEN VERARBEITEN
 # ============================================================
 
-async def handle_text(
-    update: Update,
-    context: ContextTypes.DEFAULT_TYPE,
-):
+async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
     message = update.effective_message
     chat = update.effective_chat
 
@@ -1516,13 +1338,9 @@ async def handle_text(
 
     text = message.text.strip()
     group = is_group(chat.type)
-
     replied_photo = None
 
-    if (
-        message.reply_to_message
-        and message.reply_to_message.photo
-    ):
+    if message.reply_to_message and message.reply_to_message.photo:
         replied_photo = message.reply_to_message
 
     image_request = extract_image_request(
@@ -1561,9 +1379,7 @@ async def handle_text(
             return
 
     if group and not group_should_respond(
-        chat.id,
-        text,
-        context.bot.username or "",
+        chat.id, text, context.bot.username or ""
     ):
         return
 
@@ -1574,17 +1390,10 @@ async def handle_text(
         return
 
     await message.chat.send_action("typing")
-
-    reply = await asyncio.to_thread(
-        get_ai_reply,
-        chat.id,
-        text,
-    )
+    reply = await asyncio.to_thread(get_ai_reply, chat.id, text)
 
     await send_reply_in_preferred_format(
-        message,
-        reply,
-        voice_reply=False,
+        message, reply, voice_reply=False
     )
 
 
@@ -1592,10 +1401,7 @@ async def handle_text(
 # SPRACHNACHRICHTEN VERARBEITEN
 # ============================================================
 
-async def handle_voice(
-    update: Update,
-    context: ContextTypes.DEFAULT_TYPE,
-):
+async def handle_voice(update: Update, context: ContextTypes.DEFAULT_TYPE):
     message = update.effective_message
     chat = update.effective_chat
 
@@ -1618,18 +1424,14 @@ async def handle_voice(
     file_path = None
 
     try:
-        tg_file = await context.bot.get_file(
-            message.voice.file_id
-        )
+        tg_file = await context.bot.get_file(message.voice.file_id)
 
         with tempfile.NamedTemporaryFile(
-            suffix=".ogg",
-            delete=False,
+            suffix=".ogg", delete=False
         ) as tmp:
             file_path = tmp.name
 
         await tg_file.download_to_drive(file_path)
-
         spoken_text = await transcribe_voice(file_path)
 
         if not spoken_text:
@@ -1662,31 +1464,22 @@ async def handle_voice(
                 return
 
         if group and not group_should_respond(
-            chat.id,
-            spoken_text,
-            context.bot.username or "",
+            chat.id, spoken_text, context.bot.username or ""
         ):
             return
 
-        learned = learn_from_text(
-            chat.id,
-            spoken_text,
-        )
+        learned = learn_from_text(chat.id, spoken_text)
 
         if learned:
             await message.reply_text(learned)
             return
 
         reply = await asyncio.to_thread(
-            get_ai_reply,
-            chat.id,
-            spoken_text,
+            get_ai_reply, chat.id, spoken_text
         )
 
         await send_reply_in_preferred_format(
-            message,
-            reply,
-            voice_reply=True,
+            message, reply, voice_reply=True
         )
 
     except Exception:
@@ -1709,43 +1502,67 @@ async def handle_voice(
 
 
 # ============================================================
-# GEMINI-FOTOANALYSE MIT WIEDERHOLUNG UND MODELL-FALLBACK
+# GEMINI-FOTOANALYSE MIT RETRIES UND ERSATZMODELL
 # ============================================================
 
-async def analyze_photo_with_gemini(
-    client,
-    image_prompt,
-    image_part,
-):
+def is_retryable_gemini_error(exc):
+    """Erkennt vorübergehende Fehler, bei denen ein neuer Versuch hilft."""
+
+    error_text = str(exc).lower()
+
+    return any(
+        marker in error_text
+        for marker in (
+            "503",
+            "unavailable",
+            "high demand",
+            "429",
+            "resource_exhausted",
+            "500",
+            "internal server error",
+            "502",
+            "504",
+            "deadline_exceeded",
+            "timeout",
+            "timed out",
+        )
+    )
+
+
+async def analyze_photo_with_gemini(client, image_prompt, image_part):
     """
-    Versucht die Fotoanalyse bei vorübergehenden Fehlern erneut.
-    Nutzt optional ein Ersatzmodell aus GEMINI_FALLBACK_MODEL.
+    Probiert das Hauptmodell aus und wechselt bei Fehlern zum Ersatzmodell.
+    Jeder einzelne API-Aufruf hat sein eigenes Zeitlimit.
     """
 
     from google.genai import types
 
-    models = [GEMINI_MODEL]
+    models = []
 
-    if (
-        GEMINI_FALLBACK_MODEL
-        and GEMINI_FALLBACK_MODEL != GEMINI_MODEL
-    ):
-        models.append(GEMINI_FALLBACK_MODEL)
+    for model in (GEMINI_MODEL, GEMINI_FALLBACK_MODEL):
+        if model and model not in models:
+            models.append(model)
+
+    if not models:
+        raise RuntimeError(
+            "Es wurde kein Gemini-Modell konfiguriert."
+        )
 
     last_error = None
 
-    for model in models:
-        for attempt in range(3):
+    for model_index, model in enumerate(models):
+        for attempt in range(GEMINI_MAX_ATTEMPTS_PER_MODEL):
             try:
                 logger.info(
-                    "Gemini-Fotoanalyse gestartet: Modell=%s, Versuch=%s",
+                    "Fotoanalyse: Modell=%s, Versuch=%s/%s",
                     model,
                     attempt + 1,
+                    GEMINI_MAX_ATTEMPTS_PER_MODEL,
                 )
 
-                result = await asyncio.to_thread(
-                    lambda: client.models.generate_content(
-                        model=model,
+                request = asyncio.to_thread(
+                    lambda selected_model=model: client.models.generate_content(
+                        model=selected_model,
                         contents=[image_prompt, image_part],
                         config=types.GenerateContentConfig(
                             temperature=0.3,
@@ -1754,9 +1571,18 @@ async def analyze_photo_with_gemini(
                     )
                 )
 
+                result = await asyncio.wait_for(
+                    request,
+                    timeout=GEMINI_ATTEMPT_TIMEOUT,
+                )
+
                 answer = getattr(result, "text", None)
 
                 if answer and answer.strip():
+                    logger.info(
+                        "Fotoanalyse erfolgreich mit Modell %s",
+                        model,
+                    )
                     return answer.strip()
 
                 raise RuntimeError(
@@ -1765,27 +1591,11 @@ async def analyze_photo_with_gemini(
 
             except Exception as exc:
                 last_error = exc
-                error_text = str(exc).lower()
-
-                retryable = any(
-                    marker in error_text
-                    for marker in (
-                        "503",
-                        "unavailable",
-                        "429",
-                        "resource_exhausted",
-                        "500",
-                        "internal server error",
-                        "504",
-                        "deadline_exceeded",
-                        "timeout",
-                        "timed out",
-                    )
-                )
+                retryable = is_retryable_gemini_error(exc)
 
                 logger.warning(
-                    "Gemini-Fehler: Modell=%s, Versuch=%s, "
-                    "erneut versuchen=%s, Fehler=%s",
+                    "Fotoanalysefehler: Modell=%s, Versuch=%s, "
+                    "vorübergehend=%s, Fehler=%s",
                     model,
                     attempt + 1,
                     retryable,
@@ -1793,29 +1603,31 @@ async def analyze_photo_with_gemini(
                 )
 
                 if not retryable:
+                    # Bei ungültigem Modell, Berechtigungsfehlern
+                    # oder einem ungültigen Schlüssel sofort zum
+                    # nächsten Modell wechseln.
                     break
 
-                if attempt < 2:
+                if attempt + 1 < GEMINI_MAX_ATTEMPTS_PER_MODEL:
                     wait_seconds = 2 ** (attempt + 1)
-
                     logger.info(
-                        "Warte %s Sekunden vor erneutem Gemini-Versuch.",
+                        "Wiederhole Gemini-Anfrage nach %s Sekunden.",
                         wait_seconds,
                     )
-
                     await asyncio.sleep(wait_seconds)
 
-        logger.warning(
-            "Gemini-Modell %s konnte die Fotoanalyse "
-            "nicht abschließen.",
-            model,
-        )
+        if model_index + 1 < len(models):
+            logger.warning(
+                "Wechsle von Gemini-Modell %s zu Ersatzmodell %s",
+                model,
+                models[model_index + 1],
+            )
 
     if last_error:
         raise last_error
 
     raise RuntimeError(
-        "Kein Gemini-Modell für die Fotoanalyse verfügbar."
+        "Alle konfigurierten Gemini-Modelle sind fehlgeschlagen."
     )
 
 
@@ -1823,10 +1635,7 @@ async def analyze_photo_with_gemini(
 # FOTOS ANALYSIEREN ODER BEARBEITEN
 # ============================================================
 
-async def handle_photo(
-    update: Update,
-    context: ContextTypes.DEFAULT_TYPE,
-):
+async def handle_photo(update: Update, context: ContextTypes.DEFAULT_TYPE):
     message = update.effective_message
     chat = update.effective_chat
 
@@ -1836,10 +1645,14 @@ async def handle_photo(
     original_caption = (message.caption or "").strip()
     group = is_group(chat.type)
 
-    image_request = extract_image_request(
-        original_caption,
-        has_source_image=True,
-    ) if original_caption else None
+    image_request = (
+        extract_image_request(
+            original_caption,
+            has_source_image=True,
+        )
+        if original_caption
+        else None
+    )
 
     if image_request:
         request_type, prompt = image_request
@@ -1885,8 +1698,7 @@ async def handle_photo(
         )
 
         with tempfile.NamedTemporaryFile(
-            suffix=".jpg",
-            delete=False,
+            suffix=".jpg", delete=False
         ) as tmp:
             path = tmp.name
 
@@ -1894,6 +1706,11 @@ async def handle_photo(
 
         with open(path, "rb") as image_file:
             image_bytes = image_file.read()
+
+        if not image_bytes:
+            raise RuntimeError(
+                "Die heruntergeladene Bilddatei ist leer."
+            )
 
         image_part = types.Part.from_bytes(
             data=image_bytes,
@@ -1935,7 +1752,7 @@ FORMAT:
                 photo_prompt,
                 image_part,
             ),
-            timeout=120,
+            timeout=GEMINI_ANALYSIS_TIMEOUT,
         )
 
         if not answer:
@@ -1953,7 +1770,6 @@ FORMAT:
 
     except Exception as exc:
         logger.exception("Fotoanalyse fehlgeschlagen.")
-
         error_text = str(exc).lower()
 
         if (
@@ -1981,7 +1797,7 @@ FORMAT:
         ):
             user_message = (
                 "Gemini hat den Zugriff verweigert. "
-                "Bitte prüfe API-Berechtigungen und Projektzugriff."
+                "Bitte prüfe die API-Berechtigungen und den Projektzugriff."
             )
 
         elif (
@@ -1992,7 +1808,8 @@ FORMAT:
         ):
             user_message = (
                 "⚠️ Das Gemini-Limit oder die Anfragengrenze wurde "
-                "erreicht. Bitte warte etwas und versuche es erneut."
+                "erreicht. Bitte warte etwas und versuche es erneut. "
+                "Prüfe auch, ob dein Ersatzmodell verfügbar ist."
             )
 
         elif (
@@ -2002,17 +1819,23 @@ FORMAT:
         ):
             user_message = (
                 "⚠️ Gemini ist momentan stark ausgelastet. "
-                "NEXUS hat automatische Wiederholungsversuche "
-                "und die konfigurierten Ersatzmodelle ausprobiert, "
-                "aber die Fotoanalyse ist weiterhin fehlgeschlagen. "
-                "Bitte versuche es später erneut oder konfiguriere "
-                "ein verfügbares Ersatzmodell in Render."
+                "NEXUS hat Wiederholungsversuche und das konfigurierte "
+                "Ersatzmodell ausprobiert, aber die Fotoanalyse ist "
+                "weiterhin fehlgeschlagen. Bitte versuche es später "
+                "erneut oder trage in Render ein anderes verfügbares "
+                "Modell bei GEMINI_FALLBACK_MODEL ein."
             )
 
-        elif isinstance(exc, asyncio.TimeoutError):
+        elif (
+            isinstance(exc, asyncio.TimeoutError)
+            or "timeout" in error_text
+            or "timed out" in error_text
+        ):
             user_message = (
                 "⏳ Die Fotoanalyse hat zu lange gedauert. "
-                "Bitte versuche es erneut."
+                "NEXUS hat das Zeitlimit erreicht. Bitte versuche es "
+                "erneut. Falls das öfter passiert, prüfe die Render Logs "
+                "und die Verfügbarkeit der Gemini-Modelle."
             )
 
         else:
@@ -2021,7 +1844,12 @@ FORMAT:
                 "Weitere Details stehen in den Render Runtime Logs."
             )
 
-        await message.reply_text(user_message)
+        try:
+            await message.reply_text(user_message)
+        except Exception:
+            logger.exception(
+                "Fehlermeldung zur Fotoanalyse konnte nicht gesendet werden."
+            )
 
     finally:
         if path:
@@ -2041,10 +1869,7 @@ FORMAT:
 # FEHLERBEHANDLUNG
 # ============================================================
 
-async def on_error(
-    update: object,
-    context: ContextTypes.DEFAULT_TYPE,
-):
+async def on_error(update: object, context: ContextTypes.DEFAULT_TYPE):
     if context.error:
         logger.error(
             "Telegram-Fehler:",
@@ -2055,9 +1880,7 @@ async def on_error(
             ),
         )
     else:
-        logger.error(
-            "Telegram-Fehler ohne weitere Details."
-        )
+        logger.error("Telegram-Fehler ohne weitere Details.")
 
 
 # ============================================================
@@ -2071,43 +1894,21 @@ def build_application():
         .build()
     )
 
-    application.add_handler(
-        CommandHandler("start", start_command)
-    )
-
-    application.add_handler(
-        CommandHandler("reset", reset_command)
-    )
-
-    application.add_handler(
-        CommandHandler("merken", remember_command)
-    )
-
-    application.add_handler(
-        CommandHandler("gedaechtnis", memories_command)
-    )
-
-    application.add_handler(
-        CommandHandler("vergiss", forget_command)
-    )
-
-    application.add_handler(
-        CommandHandler("bild", image_command)
-    )
+    application.add_handler(CommandHandler("start", start_command))
+    application.add_handler(CommandHandler("reset", reset_command))
+    application.add_handler(CommandHandler("merken", remember_command))
+    application.add_handler(CommandHandler("gedaechtnis", memories_command))
+    application.add_handler(CommandHandler("vergiss", forget_command))
+    application.add_handler(CommandHandler("bild", image_command))
 
     application.add_handler(
         MessageHandler(filters.VOICE, handle_voice)
     )
-
     application.add_handler(
         MessageHandler(filters.PHOTO, handle_photo)
     )
-
     application.add_handler(
-        MessageHandler(
-            filters.TEXT & ~filters.COMMAND,
-            handle_text,
-        )
+        MessageHandler(filters.TEXT & ~filters.COMMAND, handle_text)
     )
 
     application.add_error_handler(on_error)
@@ -2141,9 +1942,7 @@ async def run_bot_async():
         await application.start()
         started = True
 
-        await updater.start_polling(
-            drop_pending_updates=False
-        )
+        await updater.start_polling(drop_pending_updates=False)
         polling_started = True
 
         logger.info(
@@ -2153,9 +1952,7 @@ async def run_bot_async():
         await asyncio.Event().wait()
 
     finally:
-        logger.info(
-            "Telegram-Bot wird heruntergefahren …"
-        )
+        logger.info("Telegram-Bot wird heruntergefahren …")
 
         if polling_started:
             try:
@@ -2186,13 +1983,10 @@ def main():
     init_db()
 
     if not TELEGRAM_TOKEN:
-        logger.error(
-            "Bot startet nicht: TELEGRAM_TOKEN fehlt."
-        )
+        logger.error("Bot startet nicht: TELEGRAM_TOKEN fehlt.")
         return
 
     logger.info("NEXUS Telegram-Bot startet.")
-
     asyncio.run(run_bot_async())
 
 
@@ -2209,15 +2003,12 @@ def start_bot_thread():
 
     with _bot_lock:
         if _bot_thread and _bot_thread.is_alive():
-            logger.info(
-                "Telegram-Bot-Thread läuft bereits."
-            )
+            logger.info("Telegram-Bot-Thread läuft bereits.")
             return
 
         if not TELEGRAM_TOKEN:
             logger.warning(
-                "Telegram-Bot bleibt aus, "
-                "da TELEGRAM_TOKEN fehlt."
+                "Telegram-Bot bleibt aus, da TELEGRAM_TOKEN fehlt."
             )
             return
 
@@ -2236,10 +2027,7 @@ def start_bot_thread():
         )
 
         _bot_thread.start()
-
-        logger.info(
-            "Telegram-Bot-Thread wurde gestartet."
-        )
+        logger.info("Telegram-Bot-Thread wurde gestartet.")
 
 
 # ============================================================
