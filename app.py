@@ -1,4 +1,3 @@
-
 import os
 import re
 import html
@@ -122,9 +121,14 @@ SPRACHE UND STIL:
 - Beantworte zuerst die eigentliche Frage.
 - Vermeide unnötige Einleitungen, Wiederholungen und überlange Erklärungen.
 - Erfinde keine Fakten. Weise ehrlich auf Unsicherheiten hin.
-- Verwende den Telegram-Profilnamen ausschließlich bei Begrüßungen
-  und Verabschiedungen. Verwende ihn nicht in normalen Antworten.
-- Erfrage nicht den Namen, wenn Telegram bereits einen Profilnamen liefert.
+- Verwende den Telegram-Profilnamen ausschließlich bei Begrüßungen,
+  Verabschiedungen oder wenn der Nutzer ausdrücklich nach seinem Namen fragt.
+- Verwende den Profilnamen nicht in normalen Antworten.
+- Wenn der Nutzer fragt, wie er heißt, wie sein Name lautet oder ob du
+  seinen Namen kennst, verwende ausschließlich den vom Programm
+  bereitgestellten Telegram-Profilnamen. Frage nicht nach seinem Namen.
+- Behaupte niemals, den Namen nicht zu kennen, wenn der Telegram-Profilname
+  verfügbar ist.
 - Behandle Informationen und Erinnerungen verschiedener Nutzer getrennt.
 - Übertrage persönliche Erinnerungen niemals auf andere Nutzer.
 
@@ -191,6 +195,37 @@ def get_session_key(chat_id, user_id):
     return f"{chat_id}:{user_id}"
 
 
+def is_name_question(text):
+    """
+    Erkennt Fragen, mit denen der Nutzer nach seinem eigenen
+    Telegram-Profilnamen fragt.
+    """
+    text = (text or "").strip().lower()
+    text = re.sub(r"[!?.,;:]+", " ", text)
+    text = re.sub(r"\s+", " ", text).strip()
+
+    patterns = [
+        r"\bwie heiße ich\b",
+        r"\bwie heisse ich\b",
+        r"\bwie ist mein name\b",
+        r"\bwie lautet mein name\b",
+        r"\bwie ist mein voller name\b",
+        r"\bwie lautet mein voller name\b",
+        r"\bkennst du meinen namen\b",
+        r"\bweißt du meinen namen\b",
+        r"\bweisst du meinen namen\b",
+        r"\bwas ist mein name\b",
+        r"\bwie heiße ich bei telegram\b",
+        r"\bwie heisse ich bei telegram\b",
+        r"\bwie ist mein telegram name\b",
+        r"\bwie lautet mein telegram name\b",
+        r"\bwie heiße ich hier\b",
+        r"\bwie heisse ich hier\b",
+    ]
+
+    return any(re.search(pattern, text) for pattern in patterns)
+
+
 # ============================================================
 # DATENBANK UND PERSÖNLICHES GEDÄCHTNIS
 # ============================================================
@@ -207,7 +242,6 @@ def db_connect():
 def init_db():
     try:
         with db_connect() as conn:
-            # Neue Tabellen: Erinnerungen sind pro Nutzer getrennt.
             conn.execute("""
                 CREATE TABLE IF NOT EXISTS user_memories (
                     chat_id TEXT NOT NULL,
@@ -248,9 +282,6 @@ def init_db():
                     PRIMARY KEY (chat_id, user_id)
                 )
             """)
-
-            # Alte Tabellen bleiben unangetastet, damit ein Update
-            # bestehende Daten nicht versehentlich löscht.
 
     except Exception:
         logger.exception("Datenbank konnte nicht initialisiert werden.")
@@ -395,6 +426,7 @@ def mark_greeted(chat_id, user_id):
 def learn_from_text(chat_id, user_id, text):
     patterns = [
         (r"\bich heiße\s+(.+)", "Name"),
+        (r"\bich heisse\s+(.+)", "Name"),
         (r"\bmein name ist\s+(.+)", "Name"),
         (r"\bich mag\s+(.+)", "Mag"),
         (r"\bich liebe\s+(.+)", "Mag"),
@@ -990,7 +1022,6 @@ async def reset_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user_id = get_user_id(update)
     session_key = get_session_key(chat_id, user_id)
 
-    # Nur den Verlauf des aktuellen Nutzers zurücksetzen.
     chat_history.pop(session_key, None)
 
     try:
@@ -1309,9 +1340,20 @@ async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
             )
             return
 
+    # ========================================================
+    # KORREKTUR: TELEGRAM-PROFILNAMEN DIREKT VERWENDEN
+    # ========================================================
+
+    # Diese Prüfung erfolgt vor dem KI-Aufruf. Dadurch kann die KI
+    # keinen anderen Namen erfinden oder behaupten, ihn nicht zu kennen.
+    if is_name_question(text):
+        if not group or is_addressed(text, context.bot.username or ""):
+            await message.reply_text(f"Du heißt bei Telegram {name}.")
+        return
+
     # Begrüßung/Verabschiedung in privaten Chats.
-    # In Gruppen reagiert NEXUS darauf nur, wenn er gemeint ist
-    # oder die Unterhaltung mit ihm noch aktiv ist.
+    # In Gruppen nur antworten, wenn NEXUS gemeint ist oder die
+    # Unterhaltung mit NEXUS noch aktiv ist.
     if is_farewell_phrase(text):
         if not group or can_handle_group_farewell(
             chat.id, text, context.bot.username or ""
@@ -1325,7 +1367,9 @@ async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if is_stop_phrase(text):
         if not group or is_addressed(text, context.bot.username or ""):
             group_active_until.pop(chat.id, None)
-            await message.reply_text(f"Alles klar, {name if not group else 'ich'}! Ich bin jetzt still. 🤐")
+            await message.reply_text(
+                f"Alles klar, {name if not group else 'ich'}! Ich bin jetzt still. 🤐"
+            )
         return
 
     if group and not group_should_respond(
@@ -1344,10 +1388,14 @@ async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return
 
     await message.chat.send_action("typing")
+
     reply = await asyncio.to_thread(
         get_ai_reply, chat.id, user_id, text
     )
-    await send_reply_in_preferred_format(message, reply, voice_reply=False)
+
+    await send_reply_in_preferred_format(
+        message, reply, voice_reply=False
+    )
 
 
 # ============================================================
@@ -1388,7 +1436,17 @@ async def handle_voice(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
         if not spoken_text:
             if not group:
-                await message.reply_text("Ich konnte die Sprachnachricht leider nicht verstehen.")
+                await message.reply_text(
+                    "Ich konnte die Sprachnachricht leider nicht verstehen."
+                )
+            return
+
+        # Auch bei Sprachnachrichten wird nach dem Telegram-Profilnamen gefragt.
+        if is_name_question(spoken_text):
+            if not group or is_addressed(
+                spoken_text, context.bot.username or ""
+            ):
+                await message.reply_text(f"Du heißt bei Telegram {name}.")
             return
 
         image_request = extract_image_request(spoken_text)
@@ -1415,7 +1473,9 @@ async def handle_voice(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 chat.id, spoken_text, context.bot.username or ""
             ):
                 group_active_until.pop(chat.id, None)
-                await message.reply_text(f"Mach's gut, {name}! 😊 Bis zum nächsten Mal!")
+                await message.reply_text(
+                    f"Mach's gut, {name}! 😊 Bis zum nächsten Mal!"
+                )
             return
 
         if group and not group_should_respond(
@@ -1424,7 +1484,9 @@ async def handle_voice(update: Update, context: ContextTypes.DEFAULT_TYPE):
             return
 
         if should_greet_user(chat.id, user_id):
-            await message.reply_text(f"Hallo {name}! Schön, dass du da bist. 😊")
+            await message.reply_text(
+                f"Hallo {name}! Schön, dass du da bist. 😊"
+            )
             mark_greeted(chat.id, user_id)
 
         learned = learn_from_text(chat.id, user_id, spoken_text)
@@ -1435,12 +1497,17 @@ async def handle_voice(update: Update, context: ContextTypes.DEFAULT_TYPE):
         reply = await asyncio.to_thread(
             get_ai_reply, chat.id, user_id, spoken_text
         )
-        await send_reply_in_preferred_format(message, reply, voice_reply=True)
+
+        await send_reply_in_preferred_format(
+            message, reply, voice_reply=True
+        )
 
     except Exception:
         logger.exception("Verarbeitung der Sprachnachricht fehlgeschlagen.")
         if not group:
-            await message.reply_text("Beim Verarbeiten der Sprachnachricht ist ein Fehler passiert.")
+            await message.reply_text(
+                "Beim Verarbeiten der Sprachnachricht ist ein Fehler passiert."
+            )
 
     finally:
         if file_path:
@@ -1498,17 +1565,28 @@ async def analyze_photo_with_gemini(client, image_prompt, image_part):
                         ),
                     )
                 )
-                result = await asyncio.wait_for(request, timeout=GEMINI_ATTEMPT_TIMEOUT)
+
+                result = await asyncio.wait_for(
+                    request, timeout=GEMINI_ATTEMPT_TIMEOUT
+                )
+
                 answer = getattr(result, "text", None)
                 answer = answer.strip() if answer else ""
 
                 if not answer:
-                    raise RuntimeError(f"Gemini-Modell {model} hat keinen Text geliefert.")
+                    raise RuntimeError(
+                        f"Gemini-Modell {model} hat keinen Text geliefert."
+                    )
 
                 word_count = count_words(answer)
 
-                if word_count < GEMINI_PHOTO_MIN_WORDS and attempt + 1 < GEMINI_MAX_ATTEMPTS_PER_MODEL:
-                    logger.warning("Fotoanalyse zu kurz (%s Wörter).", word_count)
+                if (
+                    word_count < GEMINI_PHOTO_MIN_WORDS
+                    and attempt + 1 < GEMINI_MAX_ATTEMPTS_PER_MODEL
+                ):
+                    logger.warning(
+                        "Fotoanalyse zu kurz (%s Wörter).", word_count
+                    )
 
                     expanded_prompt = (
                         image_prompt
@@ -1532,13 +1610,22 @@ async def analyze_photo_with_gemini(client, image_prompt, image_part):
                             ),
                         )
                     )
+
                     expanded_result = await asyncio.wait_for(
                         expanded_request, timeout=GEMINI_ATTEMPT_TIMEOUT
                     )
-                    expanded_answer = getattr(expanded_result, "text", None)
-                    expanded_answer = expanded_answer.strip() if expanded_answer else ""
 
-                    if expanded_answer and count_words(expanded_answer) > word_count:
+                    expanded_answer = getattr(
+                        expanded_result, "text", None
+                    )
+                    expanded_answer = (
+                        expanded_answer.strip() if expanded_answer else ""
+                    )
+
+                    if (
+                        expanded_answer
+                        and count_words(expanded_answer) > word_count
+                    ):
                         answer = expanded_answer
                         word_count = count_words(answer)
 
@@ -1562,7 +1649,10 @@ async def analyze_photo_with_gemini(client, image_prompt, image_part):
 
                 if attempt + 1 < GEMINI_MAX_ATTEMPTS_PER_MODEL:
                     wait_seconds = 2 ** (attempt + 1)
-                    logger.info("Wiederhole Gemini-Anfrage nach %s Sekunden.", wait_seconds)
+                    logger.info(
+                        "Wiederhole Gemini-Anfrage nach %s Sekunden.",
+                        wait_seconds,
+                    )
                     await asyncio.sleep(wait_seconds)
 
         if model_index + 1 < len(models):
@@ -1613,7 +1703,9 @@ async def handle_photo(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return
 
     if not GEMINI_API_KEY:
-        await message.reply_text("Für die Fotoanalyse fehlt GEMINI_API_KEY in Render.")
+        await message.reply_text(
+            "Für die Fotoanalyse fehlt GEMINI_API_KEY in Render."
+        )
         return
 
     caption = original_caption or "Beschreibe dieses Bild ausführlich auf Deutsch."
@@ -1638,7 +1730,9 @@ async def handle_photo(update: Update, context: ContextTypes.DEFAULT_TYPE):
         if not image_bytes:
             raise RuntimeError("Die heruntergeladene Bilddatei ist leer.")
 
-        image_part = types.Part.from_bytes(data=image_bytes, mime_type="image/jpeg")
+        image_part = types.Part.from_bytes(
+            data=image_bytes, mime_type="image/jpeg"
+        )
 
         logger.info(
             "Fotoanalyse gestartet; Hauptmodell=%s, Ersatzmodell=%s, Chat=%s",
@@ -1687,9 +1781,13 @@ WICHTIGE REGELN:
         )
 
         if not answer:
-            answer = "⚠️ Ich konnte das Bild nicht zuverlässig beschreiben. Bitte versuche es erneut."
+            answer = (
+                "⚠️ Ich konnte das Bild nicht zuverlässig beschreiben. "
+                "Bitte versuche es erneut."
+            )
 
         await send_long_text(message, answer)
+
         logger.info(
             "Fotoanalyse erfolgreich abgeschlossen; Chat=%s; Wörter=%s",
             chat.id, count_words(answer),
@@ -1717,7 +1815,9 @@ WICHTIGE REGELN:
         try:
             await message.reply_text(user_message)
         except Exception:
-            logger.exception("Fehlermeldung zur Fotoanalyse konnte nicht gesendet werden.")
+            logger.exception(
+                "Fehlermeldung zur Fotoanalyse konnte nicht gesendet werden."
+            )
 
     finally:
         if path:
@@ -1767,7 +1867,9 @@ def build_application():
 
     application.add_handler(MessageHandler(filters.VOICE, handle_voice))
     application.add_handler(MessageHandler(filters.PHOTO, handle_photo))
-    application.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_text))
+    application.add_handler(
+        MessageHandler(filters.TEXT & ~filters.COMMAND, handle_text)
+    )
 
     application.add_error_handler(on_error)
     return application
@@ -1782,7 +1884,9 @@ async def run_bot_async():
     updater = application.updater
 
     if updater is None:
-        raise RuntimeError("Der Telegram-Updater konnte nicht erstellt werden.")
+        raise RuntimeError(
+            "Der Telegram-Updater konnte nicht erstellt werden."
+        )
 
     initialized = False
     started = False
@@ -1799,7 +1903,9 @@ async def run_bot_async():
         await updater.start_polling(drop_pending_updates=False)
         polling_started = True
 
-        logger.info("NEXUS Telegram-Bot läuft und empfängt Nachrichten.")
+        logger.info(
+            "NEXUS Telegram-Bot läuft und empfängt Nachrichten."
+        )
         await asyncio.Event().wait()
 
     finally:
@@ -1809,19 +1915,25 @@ async def run_bot_async():
             try:
                 await updater.stop()
             except Exception:
-                logger.exception("Fehler beim Stoppen des Telegram-Updaters.")
+                logger.exception(
+                    "Fehler beim Stoppen des Telegram-Updaters."
+                )
 
         if started:
             try:
                 await application.stop()
             except Exception:
-                logger.exception("Fehler beim Stoppen der Telegram-Anwendung.")
+                logger.exception(
+                    "Fehler beim Stoppen der Telegram-Anwendung."
+                )
 
         if initialized:
             try:
                 await application.shutdown()
             except Exception:
-                logger.exception("Fehler beim Herunterfahren der Telegram-Anwendung.")
+                logger.exception(
+                    "Fehler beim Herunterfahren der Telegram-Anwendung."
+                )
 
 
 def main():
@@ -1852,14 +1964,18 @@ def start_bot_thread():
             return
 
         if not TELEGRAM_TOKEN:
-            logger.warning("Telegram-Bot bleibt aus, da TELEGRAM_TOKEN fehlt.")
+            logger.warning(
+                "Telegram-Bot bleibt aus, da TELEGRAM_TOKEN fehlt."
+            )
             return
 
         def runner():
             try:
                 main()
             except Exception:
-                logger.exception("Telegram-Bot konnte nicht gestartet werden.")
+                logger.exception(
+                    "Telegram-Bot konnte nicht gestartet werden."
+                )
 
         _bot_thread = threading.Thread(
             target=runner,
