@@ -1,3 +1,4 @@
+
 import os
 import re
 import html
@@ -25,7 +26,7 @@ from telegram.ext import (
 )
 
 # ============================================================
-# NEXUS KI-ASSISTENT — Render + Telegram
+# NEXUS KI-ASSISTENT — RENDER + TELEGRAM
 # ============================================================
 
 logging.basicConfig(
@@ -66,6 +67,12 @@ GEMINI_MODEL = os.getenv(
     "GEMINI_MODEL", "gemini-3.8-flash"
 ).strip()
 
+# Optionales Ersatzmodell für die Fotoanalyse.
+# In Render kann GEMINI_FALLBACK_MODEL gesetzt werden.
+GEMINI_FALLBACK_MODEL = os.getenv(
+    "GEMINI_FALLBACK_MODEL", ""
+).strip()
+
 # ============================================================
 # AI HORDE — BILDER ERSTELLEN UND BEARBEITEN
 # ============================================================
@@ -74,10 +81,7 @@ AI_HORDE_API_KEY = os.getenv("AI_HORDE_API_KEY", "").strip()
 AI_HORDE_API = "https://aihorde.net/api/v2"
 AI_HORDE_CLIENT_AGENT = "NEXUS-Telegram-Bot:1.0"
 
-# Maximale Wartezeit auf AI Horde
 AI_HORDE_TIMEOUT_SECONDS = 600
-
-# Bildgröße für die Generierung
 AI_HORDE_IMAGE_WIDTH = 512
 AI_HORDE_IMAGE_HEIGHT = 512
 
@@ -622,7 +626,6 @@ def extract_image_request(text, has_source_image=False):
     cleaned = re.sub(r"\s+", " ", original).strip()
     low = cleaned.lower()
 
-    # Häufige Formulierungen für eine Bildbearbeitung.
     edit_patterns = [
         r"\bbearbeite\b",
         r"\bbearbeiten\b",
@@ -658,8 +661,6 @@ def extract_image_request(text, has_source_image=False):
     )
 
     if has_source_image:
-        # Bei einem vorhandenen Foto soll ein Bildwunsch
-        # grundsätzlich die Vorlage verwenden.
         if wants_edit or re.search(
             r"\b(bild|foto|fotoaufnahme)\b",
             low,
@@ -678,16 +679,12 @@ def extract_image_request(text, has_source_image=False):
         r"\b(bild|foto|schrift|schriftzug)\b",
         low,
     ):
-        # Ohne Vorlage kann ein Edit-Wunsch nicht auf ein
-        # vorhandenes Bild angewendet werden.
-        # Bei expliziter Neugenerierung darf ein neues Bild entstehen.
         if re.search(
             r"\b(?:neues|neu|neuen|neue)\s+bild\b",
             low,
         ):
             return "create", cleaned
 
-    # Muster für das Erstellen eines neuen Bildes.
     create_patterns = [
         r"\b(?:erstelle|erstell|generiere|zeichne|male|"
         r"erzeuge|mach|mache)\b.*\bbild\b",
@@ -712,7 +709,6 @@ def extract_image_request(text, has_source_image=False):
     if wants_create:
         prompt = cleaned
 
-        # Umgangssprachliche Einleitungen aus dem Prompt entfernen.
         remove_patterns = [
             r"^(?:nexus[,!: ]*)?",
             r"^(?:ich möchte|ich moechte|ich will)\s*,?\s*"
@@ -741,15 +737,11 @@ def extract_image_request(text, has_source_image=False):
             flags=re.IGNORECASE,
         ).strip(" .,:!?")
 
-        # Wenn die Entfernung der Einleitung zu wenig übrig lässt,
-        # den Originaltext als Anweisung verwenden.
         if len(prompt) < 3:
             prompt = cleaned
 
         return "create", prompt
 
-    # Ein Bildwunsch ohne eindeutiges Verb wird erkannt,
-    # wenn der Text ausdrücklich nach einem Bildmotiv fragt.
     if re.search(
         r"\b(?:ein|eine|einen)\s+bild\s+"
         r"(?:von|mit)\s+",
@@ -768,10 +760,7 @@ async def telegram_photo_to_horde_base64(
     photo_message,
     context,
 ):
-    """
-    Lädt ein Telegram-Foto herunter und wandelt es in WebP um.
-    AI Horde erhält das Bild als Base64-Quelle für img2img.
-    """
+    """Lädt ein Telegram-Foto herunter und wandelt es in WebP um."""
 
     if not photo_message or not photo_message.photo:
         raise ValueError(
@@ -804,8 +793,6 @@ async def telegram_photo_to_horde_base64(
 
         with Image.open(temp_input) as image:
             image = image.convert("RGB")
-
-            # Begrenzung der Größe für eine zuverlässigere Übertragung.
             image.thumbnail((1536, 1536))
 
             with tempfile.NamedTemporaryFile(
@@ -909,15 +896,7 @@ async def generate_horde_image(
     context,
     source_message=None,
 ):
-    """
-    Erstellt ein neues Bild oder bearbeitet ein Foto.
-
-    source_message=None:
-        Text-zu-Bild-Generierung.
-
-    source_message vorhanden:
-        Das vorhandene Bild wird als Vorlage verwendet.
-    """
+    """Erstellt ein neues Bild oder bearbeitet ein vorhandenes Foto."""
 
     if not AI_HORDE_API_KEY:
         await message.reply_text(
@@ -988,9 +967,6 @@ async def generate_horde_image(
         if editing and source_image:
             payload["source_image"] = source_image
             payload["source_processing"] = "img2img"
-
-            # Niedrigerer Wert erhält mehr vom Original.
-            # Höherer Wert erlaubt stärkere Veränderungen.
             payload["params"]["denoising_strength"] = 0.55
 
         response_data = await asyncio.to_thread(
@@ -1019,10 +995,7 @@ async def generate_horde_image(
             + AI_HORDE_TIMEOUT_SECONDS
         )
 
-        while (
-            asyncio.get_running_loop().time()
-            < deadline
-        ):
+        while asyncio.get_running_loop().time() < deadline:
             await asyncio.sleep(5)
 
             status = await asyncio.to_thread(
@@ -1086,9 +1059,7 @@ async def generate_horde_image(
                 else "✅ Dein neues Bild"
             )
 
-            caption = (
-                f"{caption_prefix}\n\n{prompt[:850]}"
-            )
+            caption = f"{caption_prefix}\n\n{prompt[:850]}"
 
             with open(result_path, "rb") as photo:
                 await message.reply_photo(
@@ -1130,14 +1101,12 @@ async def generate_horde_image(
                     "⚠️ AI Horde hat den API-Schlüssel abgelehnt. "
                     "Bitte prüfe AI_HORDE_API_KEY in Render."
                 )
-
             elif status_code == 429:
                 error_message = (
                     "⚠️ AI Horde ist momentan stark ausgelastet "
                     "oder es gibt zu viele Anfragen. "
                     "Bitte versuche es später erneut."
                 )
-
             else:
                 error_message = (
                     f"⚠️ AI Horde meldet HTTP {status_code}. "
@@ -1292,7 +1261,6 @@ async def image_command(
     context: ContextTypes.DEFAULT_TYPE,
 ):
     message = update.effective_message
-
     prompt = " ".join(context.args).strip()
 
     if not prompt:
@@ -1549,10 +1517,6 @@ async def handle_text(
     text = message.text.strip()
     group = is_group(chat.type)
 
-    # --------------------------------------------------------
-    # 1. Prüfen, ob die Nachricht eine Antwort auf ein Foto ist.
-    # --------------------------------------------------------
-
     replied_photo = None
 
     if (
@@ -1560,10 +1524,6 @@ async def handle_text(
         and message.reply_to_message.photo
     ):
         replied_photo = message.reply_to_message
-
-    # --------------------------------------------------------
-    # 2. Bildwünsche VOR der normalen Gruppensteuerung erkennen.
-    # --------------------------------------------------------
 
     image_request = extract_image_request(
         text,
@@ -1591,7 +1551,6 @@ async def handle_text(
             )
             return
 
-        # Eine Bearbeitungsanweisung ohne zugehöriges Foto.
         if request_type == "edit":
             await message.reply_text(
                 "🖼️ Ich kann das Bild bearbeiten. "
@@ -1600,10 +1559,6 @@ async def handle_text(
                 "Änderungsbeschreibung."
             )
             return
-
-    # --------------------------------------------------------
-    # 3. Normale Gruppensteuerung bleibt erhalten.
-    # --------------------------------------------------------
 
     if group and not group_should_respond(
         chat.id,
@@ -1685,7 +1640,6 @@ async def handle_voice(
                 )
             return
 
-        # Bildwünsche aus Sprache ebenfalls erkennen.
         image_request = extract_image_request(spoken_text)
 
         if image_request:
@@ -1755,6 +1709,117 @@ async def handle_voice(
 
 
 # ============================================================
+# GEMINI-FOTOANALYSE MIT WIEDERHOLUNG UND MODELL-FALLBACK
+# ============================================================
+
+async def analyze_photo_with_gemini(
+    client,
+    image_prompt,
+    image_part,
+):
+    """
+    Versucht die Fotoanalyse bei vorübergehenden Fehlern erneut.
+    Nutzt optional ein Ersatzmodell aus GEMINI_FALLBACK_MODEL.
+    """
+
+    from google.genai import types
+
+    models = [GEMINI_MODEL]
+
+    if (
+        GEMINI_FALLBACK_MODEL
+        and GEMINI_FALLBACK_MODEL != GEMINI_MODEL
+    ):
+        models.append(GEMINI_FALLBACK_MODEL)
+
+    last_error = None
+
+    for model in models:
+        for attempt in range(3):
+            try:
+                logger.info(
+                    "Gemini-Fotoanalyse gestartet: Modell=%s, Versuch=%s",
+                    model,
+                    attempt + 1,
+                )
+
+                result = await asyncio.to_thread(
+                    lambda: client.models.generate_content(
+                        model=model,
+                        contents=[image_prompt, image_part],
+                        config=types.GenerateContentConfig(
+                            temperature=0.3,
+                            max_output_tokens=350,
+                        ),
+                    )
+                )
+
+                answer = getattr(result, "text", None)
+
+                if answer and answer.strip():
+                    return answer.strip()
+
+                raise RuntimeError(
+                    f"Gemini-Modell {model} hat keinen Text geliefert."
+                )
+
+            except Exception as exc:
+                last_error = exc
+                error_text = str(exc).lower()
+
+                retryable = any(
+                    marker in error_text
+                    for marker in (
+                        "503",
+                        "unavailable",
+                        "429",
+                        "resource_exhausted",
+                        "500",
+                        "internal server error",
+                        "504",
+                        "deadline_exceeded",
+                        "timeout",
+                        "timed out",
+                    )
+                )
+
+                logger.warning(
+                    "Gemini-Fehler: Modell=%s, Versuch=%s, "
+                    "erneut versuchen=%s, Fehler=%s",
+                    model,
+                    attempt + 1,
+                    retryable,
+                    exc,
+                )
+
+                if not retryable:
+                    break
+
+                if attempt < 2:
+                    wait_seconds = 2 ** (attempt + 1)
+
+                    logger.info(
+                        "Warte %s Sekunden vor erneutem Gemini-Versuch.",
+                        wait_seconds,
+                    )
+
+                    await asyncio.sleep(wait_seconds)
+
+        logger.warning(
+            "Gemini-Modell %s konnte die Fotoanalyse "
+            "nicht abschließen.",
+            model,
+        )
+
+    if last_error:
+        raise last_error
+
+    raise RuntimeError(
+        "Kein Gemini-Modell für die Fotoanalyse verfügbar."
+    )
+
+
+# ============================================================
 # FOTOS ANALYSIEREN ODER BEARBEITEN
 # ============================================================
 
@@ -1771,11 +1836,6 @@ async def handle_photo(
     original_caption = (message.caption or "").strip()
     group = is_group(chat.type)
 
-    # --------------------------------------------------------
-    # 1. Wenn die Bildunterschrift einen Bearbeitungswunsch
-    #    enthält, das Originalfoto direkt an AI Horde geben.
-    # --------------------------------------------------------
-
     image_request = extract_image_request(
         original_caption,
         has_source_image=True,
@@ -1784,9 +1844,6 @@ async def handle_photo(
     if image_request:
         request_type, prompt = image_request
 
-        # Bei einem Foto mit Anweisung soll das Foto als Vorlage
-        # dienen, auch wenn der Wunsch sprachlich "neues Bild"
-        # enthält.
         if request_type in ("edit", "create"):
             await generate_horde_image(
                 message=message,
@@ -1795,10 +1852,6 @@ async def handle_photo(
                 source_message=message,
             )
             return
-
-    # --------------------------------------------------------
-    # 2. Normale Fotoanalyse über Gemini bleibt erhalten.
-    # --------------------------------------------------------
 
     if group and not group_should_respond(
         chat.id,
@@ -1848,8 +1901,9 @@ async def handle_photo(
         )
 
         logger.info(
-            "Fotoanalyse gestartet; Modell=%s, Chat=%s",
+            "Fotoanalyse gestartet; Hauptmodell=%s, Ersatzmodell=%s, Chat=%s",
             GEMINI_MODEL,
+            GEMINI_FALLBACK_MODEL or "(nicht konfiguriert)",
             chat.id,
         )
 
@@ -1875,21 +1929,14 @@ FORMAT:
 - Verwende Telegram-tauglichen Markdown-Fettdruck mit **Text**.
 """
 
-        result = await asyncio.wait_for(
-            asyncio.to_thread(
-                lambda: client.models.generate_content(
-                    model=GEMINI_MODEL,
-                    contents=[photo_prompt, image_part],
-                    config=types.GenerateContentConfig(
-                        temperature=0.3,
-                        max_output_tokens=350,
-                    ),
-                )
+        answer = await asyncio.wait_for(
+            analyze_photo_with_gemini(
+                client,
+                photo_prompt,
+                image_part,
             ),
-            timeout=45,
+            timeout=120,
         )
-
-        answer = getattr(result, "text", None)
 
         if not answer:
             answer = (
@@ -1906,6 +1953,7 @@ FORMAT:
 
     except Exception as exc:
         logger.exception("Fotoanalyse fehlgeschlagen.")
+
         error_text = str(exc).lower()
 
         if (
@@ -1920,9 +1968,10 @@ FORMAT:
 
         elif "404" in error_text or "not found" in error_text:
             user_message = (
-                f"Das Gemini-Modell „{GEMINI_MODEL}“ wurde nicht gefunden "
-                "oder ist für deinen Schlüssel nicht verfügbar. "
-                "Bitte prüfe Modellname und API-Zugriff."
+                "Das Gemini-Modell wurde nicht gefunden oder ist "
+                "für deinen Schlüssel nicht verfügbar. "
+                "Bitte prüfe GEMINI_MODEL und GEMINI_FALLBACK_MODEL "
+                "in Render."
             )
 
         elif (
@@ -1939,16 +1988,37 @@ FORMAT:
             "429" in error_text
             or "quota" in error_text
             or "rate limit" in error_text
+            or "resource_exhausted" in error_text
         ):
             user_message = (
-                "Das Gemini-Limit wurde erreicht. "
-                "Bitte warte etwas und versuche es erneut."
+                "⚠️ Das Gemini-Limit oder die Anfragengrenze wurde "
+                "erreicht. Bitte warte etwas und versuche es erneut."
+            )
+
+        elif (
+            "503" in error_text
+            or "unavailable" in error_text
+            or "high demand" in error_text
+        ):
+            user_message = (
+                "⚠️ Gemini ist momentan stark ausgelastet. "
+                "NEXUS hat automatische Wiederholungsversuche "
+                "und die konfigurierten Ersatzmodelle ausprobiert, "
+                "aber die Fotoanalyse ist weiterhin fehlgeschlagen. "
+                "Bitte versuche es später erneut oder konfiguriere "
+                "ein verfügbares Ersatzmodell in Render."
+            )
+
+        elif isinstance(exc, asyncio.TimeoutError):
+            user_message = (
+                "⏳ Die Fotoanalyse hat zu lange gedauert. "
+                "Bitte versuche es erneut."
             )
 
         else:
             user_message = (
                 "Die Fotoanalyse ist fehlgeschlagen. "
-                "Die genaue Ursache steht in den Render Runtime Logs."
+                "Weitere Details stehen in den Render Runtime Logs."
             )
 
         await message.reply_text(user_message)
