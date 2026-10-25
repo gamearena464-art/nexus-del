@@ -8,7 +8,7 @@ import sqlite3
 import tempfile
 import threading
 from pathlib import Path
-from datetime import datetime, timezone
+from datetime import datetime, timezone, timedelta
 from collections import defaultdict
 
 import requests
@@ -77,11 +77,7 @@ GEMINI_FALLBACK_MODEL = os.getenv(
 GEMINI_ATTEMPT_TIMEOUT = 45
 GEMINI_MAX_ATTEMPTS_PER_MODEL = 2
 GEMINI_ANALYSIS_TIMEOUT = 220
-
-# Maximale Ausgabelänge der Bildanalyse.
 GEMINI_PHOTO_MAX_OUTPUT_TOKENS = 1500
-
-# Wenn die erste Antwort kürzer ist, wird eine Erweiterung versucht.
 GEMINI_PHOTO_MIN_WORDS = 180
 GEMINI_PHOTO_TARGET_WORDS = 300
 
@@ -111,14 +107,10 @@ if not GROQ_API_KEY:
     logger.warning("GROQ_API_KEY fehlt.")
 
 if not GEMINI_API_KEY:
-    logger.warning(
-        "GEMINI_API_KEY fehlt; Fotoanalyse ist deaktiviert."
-    )
+    logger.warning("GEMINI_API_KEY fehlt; Fotoanalyse ist deaktiviert.")
 
 if not AI_HORDE_API_KEY:
-    logger.warning(
-        "AI_HORDE_API_KEY fehlt; Bilderstellung ist deaktiviert."
-    )
+    logger.warning("AI_HORDE_API_KEY fehlt; Bilderstellung ist deaktiviert.")
 
 groq_client = Groq(api_key=GROQ_API_KEY) if GROQ_API_KEY else None
 
@@ -131,6 +123,12 @@ SPRACHE UND STIL:
 - Beantworte zuerst die eigentliche Frage.
 - Vermeide unnötige Einleitungen, Wiederholungen und überlange Erklärungen.
 - Erfinde keine Fakten. Weise ehrlich auf Unsicherheiten hin.
+- Verwende den Telegram-Profilnamen NICHT ständig in normalen Antworten.
+- Den Profilnamen nur verwenden, wenn du jemanden persönlich begrüßt oder verabschiedest.
+- Begrüße Nutzer nicht bei jeder einzelnen Nachricht erneut.
+- Berücksichtige persönliche Erinnerungen nur für den jeweiligen Nutzer.
+- Vermische niemals Erinnerungen verschiedener Personen in einer Gruppe.
+- Behaupte nicht, etwas dauerhaft gespeichert zu haben, wenn es nicht gespeichert wurde.
 
 FORMATIERUNG FÜR TELEGRAM:
 - Nutze kurze Absätze und ausreichend Leerzeilen.
@@ -147,9 +145,8 @@ BESONDERS BEI BILDERN:
 - Beschreibe nur, was tatsächlich erkennbar ist.
 - Wenn ein Bild zur Analyse geschickt wird, beschreibe es ausführlich,
   sofern der Nutzer nicht ausdrücklich eine kurze Antwort verlangt.
-- Beschreibe das Hauptmotiv, sichtbare Details, Umgebung, Hintergrund,
+- Beschreibe Hauptmotiv, sichtbare Details, Umgebung, Hintergrund,
   Farben, Formen, Anordnung, Licht, Perspektive und Bildwirkung.
-- Nutze mehrere Absätze und aussagekräftige Stichpunkte.
 - Erfinde keine Details, die im Bild nicht erkennbar sind.
 
 Wenn jemand fragt, wer dich programmiert oder erfunden hat,
@@ -158,15 +155,21 @@ antworte: "Der liebe Heiko aus dem Schwabenländle. 😊"
 Sei jederzeit hilfreich, respektvoll und geduldig.
 """.strip()
 
+# Kurzzeitverlauf ist jetzt pro Chat UND Nutzer getrennt.
 chat_history = defaultdict(list)
+
+# Aktivität der Gruppe bleibt pro Chat bestehen.
 group_active_until = {}
 
 MAX_HISTORY_MESSAGES = 12
 GROUP_ACTIVE_SECONDS = 180
 
+# Nutzer werden nach 12 Stunden ohne Kontakt erneut begrüßt.
+GREETING_AFTER_HOURS = 12
+
 
 # ============================================================
-# DATENBANK UND GEDÄCHTNIS
+# DATENBANK UND PERSÖNLICHES GEDÄCHTNIS
 # ============================================================
 
 def db_connect():
@@ -175,13 +178,14 @@ def db_connect():
 
     connection = sqlite3.connect(str(path), timeout=30)
     connection.execute("PRAGMA journal_mode=WAL")
-
     return connection
 
 
 def init_db():
     try:
         with db_connect() as conn:
+            # Alte Tabellen bleiben erhalten, damit bestehende Daten
+            # nicht beim Update gelöscht werden.
             conn.execute("""
                 CREATE TABLE IF NOT EXISTS memories (
                     chat_id TEXT NOT NULL,
@@ -202,108 +206,226 @@ def init_db():
                 )
             """)
 
+            # Neue Erinnerungen sind pro Chat und Telegram-Nutzer getrennt.
+            conn.execute("""
+                CREATE TABLE IF NOT EXISTS user_memories (
+                    chat_id TEXT NOT NULL,
+                    user_id TEXT NOT NULL,
+                    memory_key TEXT NOT NULL,
+                    memory_value TEXT NOT NULL,
+                    updated_at TEXT NOT NULL,
+                    PRIMARY KEY (chat_id, user_id, memory_key, memory_value)
+                )
+            """)
+
+            conn.execute("""
+                CREATE TABLE IF NOT EXISTS user_conversation_log (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    chat_id TEXT NOT NULL,
+                    user_id TEXT NOT NULL,
+                    role TEXT NOT NULL,
+                    content TEXT NOT NULL,
+                    created_at TEXT NOT NULL
+                )
+            """)
+
+            conn.execute("""
+                CREATE TABLE IF NOT EXISTS user_sessions (
+                    chat_id TEXT NOT NULL,
+                    user_id TEXT NOT NULL,
+                    display_name TEXT NOT NULL DEFAULT '',
+                    last_seen TEXT NOT NULL,
+                    PRIMARY KEY (chat_id, user_id)
+                )
+            """)
+
     except Exception:
-        logger.exception(
-            "Datenbank konnte nicht initialisiert werden."
-        )
+        logger.exception("Datenbank konnte nicht initialisiert werden.")
 
 
-def save_memory(chat_id, key, value):
+def save_memory(chat_id, user_id, key, value):
+    """Speichert eine Erinnerung für genau einen Nutzer in einem Chat."""
     try:
         with db_connect() as conn:
             conn.execute("""
-                INSERT INTO memories(
-                    chat_id, memory_key, memory_value, updated_at
+                INSERT INTO user_memories(
+                    chat_id, user_id, memory_key, memory_value, updated_at
                 )
-                VALUES (?, ?, ?, ?)
-                ON CONFLICT(chat_id, memory_key)
-                DO UPDATE SET
-                    memory_value=excluded.memory_value,
-                    updated_at=excluded.updated_at
+                VALUES (?, ?, ?, ?, ?)
+                ON CONFLICT(chat_id, user_id, memory_key, memory_value)
+                DO UPDATE SET updated_at=excluded.updated_at
             """, (
                 str(chat_id),
-                key[:100],
-                value[:1000],
+                str(user_id),
+                str(key)[:100],
+                str(value)[:1000],
                 datetime.now(timezone.utc).isoformat(),
             ))
-
         return True
 
     except Exception:
-        logger.exception(
-            "Speichern der Erinnerung fehlgeschlagen."
-        )
+        logger.exception("Speichern der persönlichen Erinnerung fehlgeschlagen.")
         return False
 
 
-def get_memories(chat_id, limit=30):
+def get_memories(chat_id, user_id, limit=30):
+    """Lädt ausschließlich Erinnerungen des betreffenden Nutzers."""
     try:
         with db_connect() as conn:
-            rows = conn.execute(
-                """
+            rows = conn.execute("""
                 SELECT memory_key, memory_value
-                FROM memories
-                WHERE chat_id=?
+                FROM user_memories
+                WHERE chat_id=? AND user_id=?
                 ORDER BY updated_at DESC
                 LIMIT ?
-                """,
-                (str(chat_id), limit),
-            ).fetchall()
+            """, (str(chat_id), str(user_id), limit)).fetchall()
 
         return rows
 
     except Exception:
-        logger.exception(
-            "Lesen der Erinnerungen fehlgeschlagen."
-        )
+        logger.exception("Lesen der persönlichen Erinnerungen fehlgeschlagen.")
         return []
 
 
-def forget_memory(chat_id, key):
+def forget_memory(chat_id, user_id, key):
     try:
         with db_connect() as conn:
-            cur = conn.execute(
-                """
-                DELETE FROM memories
-                WHERE chat_id=? AND memory_key LIKE ?
-                """,
-                (str(chat_id), f"%{key}%"),
-            )
-
+            cur = conn.execute("""
+                DELETE FROM user_memories
+                WHERE chat_id=? AND user_id=?
+                  AND (memory_key LIKE ? OR memory_value LIKE ?)
+            """, (
+                str(chat_id),
+                str(user_id),
+                f"%{key}%",
+                f"%{key}%",
+            ))
             return cur.rowcount
 
     except Exception:
-        logger.exception(
-            "Löschen der Erinnerung fehlgeschlagen."
-        )
+        logger.exception("Löschen der persönlichen Erinnerung fehlgeschlagen.")
         return 0
 
 
-def log_message(chat_id, role, content):
+def log_message(chat_id, user_id, role, content):
     try:
         with db_connect() as conn:
-            conn.execute(
-                """
-                INSERT INTO conversation_log(
-                    chat_id, role, content, created_at
+            conn.execute("""
+                INSERT INTO user_conversation_log(
+                    chat_id, user_id, role, content, created_at
                 )
-                VALUES (?, ?, ?, ?)
-                """,
-                (
-                    str(chat_id),
-                    role,
-                    content[:4000],
-                    datetime.now(timezone.utc).isoformat(),
-                ),
-            )
+                VALUES (?, ?, ?, ?, ?)
+            """, (
+                str(chat_id),
+                str(user_id),
+                role,
+                str(content)[:4000],
+                datetime.now(timezone.utc).isoformat(),
+            ))
 
     except Exception:
-        logger.exception(
-            "Nachrichtenprotokoll konnte nicht gespeichert werden."
+        logger.exception("Persönliches Nachrichtenprotokoll konnte nicht gespeichert werden.")
+
+
+def get_recent_logged_messages(chat_id, user_id, limit=MAX_HISTORY_MESSAGES):
+    """Lädt den letzten Gesprächsverlauf auch nach einem Neustart."""
+    try:
+        with db_connect() as conn:
+            rows = conn.execute("""
+                SELECT role, content
+                FROM user_conversation_log
+                WHERE chat_id=? AND user_id=?
+                ORDER BY id DESC
+                LIMIT ?
+            """, (str(chat_id), str(user_id), limit)).fetchall()
+
+        rows.reverse()
+        return [
+            {"role": role, "content": content}
+            for role, content in rows
+        ]
+
+    except Exception:
+        logger.exception("Laden des gespeicherten Gesprächsverlaufs fehlgeschlagen.")
+        return []
+
+
+def clear_user_history(chat_id, user_id):
+    """Setzt nur den Verlauf dieses Nutzers zurück, nicht seine Erinnerungen."""
+    try:
+        with db_connect() as conn:
+            conn.execute("""
+                DELETE FROM user_conversation_log
+                WHERE chat_id=? AND user_id=?
+            """, (str(chat_id), str(user_id)))
+        return True
+
+    except Exception:
+        logger.exception("Gesprächsverlauf konnte nicht zurückgesetzt werden.")
+        return False
+
+
+def get_display_name(update):
+    """Liefert den Namen aus dem Telegram-Profil."""
+    user = update.effective_user
+
+    if not user:
+        return "Freund"
+
+    name = (user.full_name or user.first_name or "").strip()
+    return name[:100] if name else "Freund"
+
+
+def should_greet_user(chat_id, user_id):
+    """Begrüßt einen Nutzer nur beim ersten Kontakt oder nach längerer Pause."""
+    try:
+        with db_connect() as conn:
+            row = conn.execute("""
+                SELECT last_seen
+                FROM user_sessions
+                WHERE chat_id=? AND user_id=?
+            """, (str(chat_id), str(user_id))).fetchone()
+
+        if not row:
+            return True
+
+        last_seen = datetime.fromisoformat(row[0])
+        if last_seen.tzinfo is None:
+            last_seen = last_seen.replace(tzinfo=timezone.utc)
+
+        return (
+            datetime.now(timezone.utc) - last_seen
+            >= timedelta(hours=GREETING_AFTER_HOURS)
         )
 
+    except Exception:
+        logger.exception("Nutzersitzung konnte nicht geprüft werden.")
+        return False
 
-def learn_from_text(chat_id, text):
+
+def update_user_session(chat_id, user_id, display_name):
+    try:
+        with db_connect() as conn:
+            conn.execute("""
+                INSERT INTO user_sessions(
+                    chat_id, user_id, display_name, last_seen
+                )
+                VALUES (?, ?, ?, ?)
+                ON CONFLICT(chat_id, user_id)
+                DO UPDATE SET
+                    display_name=excluded.display_name,
+                    last_seen=excluded.last_seen
+            """, (
+                str(chat_id),
+                str(user_id),
+                str(display_name)[:100],
+                datetime.now(timezone.utc).isoformat(),
+            ))
+    except Exception:
+        logger.exception("Nutzersitzung konnte nicht gespeichert werden.")
+
+
+def learn_from_text(chat_id, user_id, text):
     patterns = [
         (r"\bich heiße\s+(.+)", "Name"),
         (r"\bmein name ist\s+(.+)", "Name"),
@@ -316,21 +438,14 @@ def learn_from_text(chat_id, text):
     ]
 
     for pattern, key in patterns:
-        match = re.search(
-            pattern,
-            text,
-            flags=re.IGNORECASE,
-        )
+        match = re.search(pattern, text, flags=re.IGNORECASE)
 
         if match:
             value = match.group(1).strip(" .!?")
 
             if value:
-                save_memory(chat_id, key, value)
-                return (
-                    f"Alles klar, ich merke mir: "
-                    f"{key} – {value} 😊"
-                )
+                if save_memory(chat_id, user_id, key, value):
+                    return f"Alles klar, ich merke mir: {key} – {value} 😊"
 
     return None
 
@@ -341,12 +456,7 @@ def learn_from_text(chat_id, text):
 
 def markdown_to_telegram_html(text):
     """Konvertiert Markdown sicher für Telegram."""
-
-    text = (
-        (text or "")
-        .replace("\r\n", "\n")
-        .replace("\r", "\n")
-    )
+    text = ((text or "").replace("\r\n", "\n").replace("\r", "\n"))
 
     lines = text.split("\n")
     converted_lines = []
@@ -367,7 +477,6 @@ def markdown_to_telegram_html(text):
                     cell.strip()
                     for cell in line.strip().strip("|").split("|")
                 ]
-
                 i += 2
 
                 while i < len(lines) and lines[i].count("|") >= 2:
@@ -375,23 +484,16 @@ def markdown_to_telegram_html(text):
                         cell.strip()
                         for cell in lines[i].strip().strip("|").split("|")
                     ]
-
                     parts = []
 
                     for j, cell in enumerate(cells):
                         if not cell:
                             continue
-
                         label = headers[j] if j < len(headers) else ""
-                        parts.append(
-                            f"{label}: {cell}" if label else cell
-                        )
+                        parts.append(f"{label}: {cell}" if label else cell)
 
                     if parts:
-                        converted_lines.append(
-                            "• " + " — ".join(parts)
-                        )
-
+                        converted_lines.append("• " + " — ".join(parts))
                     i += 1
 
                 continue
@@ -415,19 +517,12 @@ def markdown_to_telegram_html(text):
     )
 
     text = html.escape(text, quote=False)
-
-    text = re.sub(
-        r"(?m)^[ \t]*(?:---+|___+|\*\*\*+)[ \t]*$",
-        "",
-        text,
-    )
-
+    text = re.sub(r"(?m)^[ \t]*(?:---+|___+|\*\*\*+)[ \t]*$", "", text)
     text = re.sub(
         r"(?m)^[ \t]{0,3}#{1,6}[ \t]*(.+?)[ \t]*#*[ \t]*$",
         r"<b>\1</b>",
         text,
     )
-
     text = re.sub(r"`([^`\n]+)`", r"<code>\1</code>", text)
     text = re.sub(r"\*\*([^\n]+?)\*\*", r"<b>\1</b>", text)
     text = re.sub(r"__([^\n]+?)__", r"<u>\1</u>", text)
@@ -435,19 +530,13 @@ def markdown_to_telegram_html(text):
     text = re.sub(r"(?m)^[ \t]*[-*][ \t]+", "• ", text)
 
     for index, block in enumerate(code_blocks):
-        text = text.replace(
-            f"NEXUSCODEPLACEHOLDER{index}END",
-            block,
-        )
+        text = text.replace(f"NEXUSCODEPLACEHOLDER{index}END", block)
 
-    return text.strip() or (
-        "Entschuldigung, ich habe gerade keine Antwort."
-    )
+    return text.strip() or "Entschuldigung, ich habe gerade keine Antwort."
 
 
 async def send_long_text(message, text, parse_mode=None):
     """Teilt lange Antworten auf, ohne Leerzeilen zu verlieren."""
-
     text = (
         text or "Entschuldigung, ich habe gerade keine Antwort."
     ).replace("\r\n", "\n").replace("\r", "\n")
@@ -461,10 +550,8 @@ async def send_long_text(message, text, parse_mode=None):
 
         if split_at < 1000:
             split_at = remaining.rfind("\n", 0, max_chunk)
-
         if split_at < 1000:
             split_at = remaining.rfind(" ", 0, max_chunk)
-
         if split_at < 1000:
             split_at = max_chunk
 
@@ -485,59 +572,51 @@ async def send_long_text(message, text, parse_mode=None):
         formatted = markdown_to_telegram_html(chunk)
 
         try:
-            await message.reply_text(
-                formatted,
-                parse_mode="HTML",
-            )
-
+            await message.reply_text(formatted, parse_mode="HTML")
         except Exception:
-            logger.exception(
-                "Telegram-HTML fehlgeschlagen; sende Klartext."
-            )
-
+            logger.exception("Telegram-HTML fehlgeschlagen; sende Klartext.")
             plain_text = html.unescape(
-                re.sub(
-                    r"</?(?:b|i|u|code|pre)>",
-                    "",
-                    formatted,
-                )
+                re.sub(r"</?(?:b|i|u|code|pre)>", "", formatted)
             )
-
             await message.reply_text(plain_text[:4000])
 
 
 # ============================================================
-# KI-ANTWORTEN
+# KI-ANTWORTEN — GEDÄCHTNIS UND VERLAUF PRO PERSON
 # ============================================================
 
-def get_ai_reply(chat_id, user_text):
+def get_ai_reply(chat_id, user_id, user_text):
     if not groq_client:
         return (
             "Meine KI ist noch nicht verbunden. "
             "Bitte prüfe GROQ_API_KEY in Render."
         )
 
-    memories = get_memories(chat_id)
+    memories = get_memories(chat_id, user_id)
     memory_text = "\n".join(
         f"- {key}: {value}" for key, value in memories
     )
 
-    messages = [
-        {"role": "system", "content": SYSTEM_PROMPT}
-    ]
+    # Verlauf dieses Nutzers im aktuellen Chat laden.
+    history_key = f"{chat_id}:{user_id}"
+    history = chat_history[history_key]
+
+    if not history:
+        history = get_recent_logged_messages(chat_id, user_id)
+
+    messages = [{"role": "system", "content": SYSTEM_PROMPT}]
 
     if memory_text:
         messages.append({
             "role": "system",
             "content": (
-                "Gespeicherte Erinnerungen für diesen Chat:\n"
+                "Persönliche Erinnerungen ausschließlich für diesen Nutzer. "
+                "Nicht mit anderen Gruppenmitgliedern vermischen:\n"
                 + memory_text
             ),
         })
 
-    messages.extend(
-        chat_history[str(chat_id)][-MAX_HISTORY_MESSAGES:]
-    )
+    messages.extend(history[-MAX_HISTORY_MESSAGES:])
     messages.append({"role": "user", "content": user_text})
 
     try:
@@ -553,15 +632,15 @@ def get_ai_reply(chat_id, user_text):
             or "Ich habe gerade keine Antwort."
         )
 
-        history = chat_history[str(chat_id)]
         history.extend([
             {"role": "user", "content": user_text[:3000]},
             {"role": "assistant", "content": answer[:3000]},
         ])
-        chat_history[str(chat_id)] = history[-MAX_HISTORY_MESSAGES:]
 
-        log_message(chat_id, "user", user_text)
-        log_message(chat_id, "assistant", answer)
+        chat_history[history_key] = history[-MAX_HISTORY_MESSAGES:]
+
+        log_message(chat_id, user_id, "user", user_text)
+        log_message(chat_id, user_id, "assistant", answer)
 
         return answer
 
@@ -586,31 +665,21 @@ def extract_image_request(text, has_source_image=False):
     low = cleaned.lower()
 
     edit_patterns = [
-        r"\bbearbeite\b",
-        r"\bbearbeiten\b",
-        r"\bverändere\b",
-        r"\bveraendere\b",
-        r"\bänder(?:e|n)\b",
-        r"\baendere\b",
+        r"\bbearbeite\b", r"\bbearbeiten\b", r"\bverändere\b",
+        r"\bveraendere\b", r"\bänder(?:e|n)\b", r"\baendere\b",
         r"\bmach(?:e)?\s+(?:das|dieses|dies|mein|mein hochgeladenes)\s+bild\b",
         r"\bmach(?:e)?\s+(?:daraus|es)\b",
         r"\bgestalte\s+(?:das|dieses|mein)\s+bild\b",
-        r"\bfüge\b",
-        r"\bfuege\b",
+        r"\bfüge\b", r"\bfuege\b",
         r"\bschreib(?:e)?\b.*\b(?:bild|foto|schrift|text|schriftzug)\b",
         r"\bschreib(?:e)?\b.*\bdazu\b",
         r"\bsetz(?:e)?\b.*\b(?:text|schrift|schriftzug)\b",
         r"\bmit\s+eleganter\s+schrift\b",
         r"\bin\s+eleganter\s+schrift\b",
-        r"\bals\s+fantasy\b",
-        r"\bals\s+comic\b",
-        r"\bals\s+anime\b",
-        r"\bals\s+gemälde\b",
-        r"\bals\s+gemaelde\b",
-        r"\bals\s+neues\s+bild\b",
-        r"\bneu\s+gestalten\b",
-        r"\bneu\s+erstellen\b",
-        r"\bneu\s+interpretieren\b",
+        r"\bals\s+fantasy\b", r"\bals\s+comic\b", r"\bals\s+anime\b",
+        r"\bals\s+gemälde\b", r"\bals\s+gemaelde\b",
+        r"\bals\s+neues\s+bild\b", r"\bneu\s+gestalten\b",
+        r"\bneu\s+erstellen\b", r"\bneu\s+interpretieren\b",
         r"\bverbessere\s+(?:das|dieses|mein)\s+bild\b",
     ]
 
@@ -621,15 +690,11 @@ def extract_image_request(text, has_source_image=False):
 
     if has_source_image:
         if wants_edit or re.search(r"\b(bild|foto|fotoaufnahme)\b", low):
-            prompt = cleaned or (
-                "Bearbeite das hochgeladene Bild "
-                "und verbessere es kreativ."
+            return "edit", cleaned or (
+                "Bearbeite das hochgeladene Bild und verbessere es kreativ."
             )
-            return "edit", prompt
 
-    elif wants_edit and re.search(
-        r"\b(bild|foto|schrift|schriftzug)\b", low
-    ):
+    elif wants_edit and re.search(r"\b(bild|foto|schrift|schriftzug)\b", low):
         if re.search(r"\b(?:neues|neu|neuen|neue)\s+bild\b", low):
             return "create", cleaned
 
@@ -643,17 +708,13 @@ def extract_image_request(text, has_source_image=False):
         r"\bkannst du\b.*\bbild\b",
         r"\bmach mir\b.*\bbild\b",
         r"\bgestalte mir\b.*\bbild\b",
-        r"\bzeichne mir\b",
-        r"\bmale mir\b",
-        r"\b/bild\b",
+        r"\bzeichne mir\b", r"\bmale mir\b", r"\b/bild\b",
     ]
 
-    wants_create = any(
+    if any(
         re.search(pattern, low, flags=re.IGNORECASE)
         for pattern in create_patterns
-    )
-
-    if wants_create:
+    ):
         prompt = cleaned
 
         remove_patterns = [
@@ -668,9 +729,7 @@ def extract_image_request(text, has_source_image=False):
         ]
 
         for pattern in remove_patterns:
-            prompt = re.sub(
-                pattern, "", prompt, flags=re.IGNORECASE
-            ).strip()
+            prompt = re.sub(pattern, "", prompt, flags=re.IGNORECASE).strip()
 
         prompt = re.sub(
             r"^(?:von|mit|über|ueber)\s+",
@@ -696,9 +755,7 @@ def extract_image_request(text, has_source_image=False):
 
 async def telegram_photo_to_horde_base64(photo_message, context):
     if not photo_message or not photo_message.photo:
-        raise ValueError(
-            "Es wurde kein verwendbares Telegram-Foto gefunden."
-        )
+        raise ValueError("Es wurde kein verwendbares Telegram-Foto gefunden.")
 
     try:
         from PIL import Image
@@ -708,17 +765,12 @@ async def telegram_photo_to_horde_base64(photo_message, context):
             "Bitte füge 'Pillow' zu requirements.txt hinzu."
         ) from exc
 
-    telegram_file = await context.bot.get_file(
-        photo_message.photo[-1].file_id
-    )
-
+    telegram_file = await context.bot.get_file(photo_message.photo[-1].file_id)
     temp_input = None
     temp_output = None
 
     try:
-        with tempfile.NamedTemporaryFile(
-            suffix=".jpg", delete=False
-        ) as tmp:
+        with tempfile.NamedTemporaryFile(suffix=".jpg", delete=False) as tmp:
             temp_input = tmp.name
 
         await telegram_file.download_to_drive(temp_input)
@@ -727,25 +779,16 @@ async def telegram_photo_to_horde_base64(photo_message, context):
             image = image.convert("RGB")
             image.thumbnail((1536, 1536))
 
-            with tempfile.NamedTemporaryFile(
-                suffix=".webp", delete=False
-            ) as tmp:
+            with tempfile.NamedTemporaryFile(suffix=".webp", delete=False) as tmp:
                 temp_output = tmp.name
 
-            image.save(
-                temp_output,
-                format="WEBP",
-                quality=90,
-                method=4,
-            )
+            image.save(temp_output, format="WEBP", quality=90, method=4)
 
         with open(temp_output, "rb") as image_file:
             image_bytes = image_file.read()
 
         if not image_bytes:
-            raise RuntimeError(
-                "Das hochgeladene Bild konnte nicht gelesen werden."
-            )
+            raise RuntimeError("Das hochgeladene Bild konnte nicht gelesen werden.")
 
         return base64.b64encode(image_bytes).decode("ascii")
 
@@ -804,23 +847,15 @@ def horde_status_sync(request_id):
 def horde_download_sync(image_url):
     response = requests.get(image_url, timeout=60)
     response.raise_for_status()
-
     content_type = response.headers.get("content-type", "").lower()
 
     if not content_type.startswith("image/"):
-        raise RuntimeError(
-            "AI Horde hat keine gültige Bilddatei zurückgegeben."
-        )
+        raise RuntimeError("AI Horde hat keine gültige Bilddatei zurückgegeben.")
 
     return response.content, content_type
 
 
-async def generate_horde_image(
-    message,
-    prompt,
-    context,
-    source_message=None,
-):
+async def generate_horde_image(message, prompt, context, source_message=None):
     if not AI_HORDE_API_KEY:
         await message.reply_text(
             "⚠️ Für die Bilderstellung fehlt AI_HORDE_API_KEY in Render."
@@ -828,11 +863,8 @@ async def generate_horde_image(
         return
 
     prompt = (prompt or "").strip()
-
     if not prompt:
-        await message.reply_text(
-            "Bitte beschreibe, was ich erstellen oder bearbeiten soll."
-        )
+        await message.reply_text("Bitte beschreibe, was ich erstellen oder bearbeiten soll.")
         return
 
     source_image = None
@@ -844,29 +876,19 @@ async def generate_horde_image(
                 "🖼️ Ich bereite dein Bild vor und bearbeite es "
                 "nach deiner Beschreibung. Das kann etwas dauern."
             )
-
-            source_image = await telegram_photo_to_horde_base64(
-                source_message, context
-            )
-
+            source_image = await telegram_photo_to_horde_base64(source_message, context)
             full_prompt = (
-                "Edit the provided source image according to the "
-                "following user instructions. Preserve the main "
-                "subject and important composition where possible. "
-                "Make only the requested changes and produce a "
-                "coherent, high-quality image. User instructions: "
+                "Edit the provided source image according to the following "
+                "user instructions. Preserve the main subject and important "
+                "composition where possible. Make only the requested changes "
+                "and produce a coherent, high-quality image. User instructions: "
                 + prompt
             )
         else:
             await message.reply_text(
-                "🎨 Ich erstelle dein Bild. "
-                "Je nach Auslastung kann es etwas dauern."
+                "🎨 Ich erstelle dein Bild. Je nach Auslastung kann es etwas dauern."
             )
-
-            full_prompt = (
-                "Create a high-quality image based on this request: "
-                + prompt
-            )
+            full_prompt = "Create a high-quality image based on this request: " + prompt
 
         payload = {
             "prompt": full_prompt,
@@ -888,149 +910,77 @@ async def generate_horde_image(
             payload["source_processing"] = "img2img"
             payload["params"]["denoising_strength"] = 0.55
 
-        response_data = await asyncio.to_thread(
-            horde_submit_sync, payload
-        )
+        response_data = await asyncio.to_thread(horde_submit_sync, payload)
         request_id = response_data.get("id")
 
         if not request_id:
-            raise RuntimeError(
-                response_data.get(
-                    "message",
-                    "AI Horde hat keine Auftrags-ID geliefert.",
-                )
-            )
+            raise RuntimeError(response_data.get("message", "AI Horde hat keine Auftrags-ID geliefert."))
 
-        logger.info(
-            "AI-Horde-Auftrag gestartet: %s; Bearbeitung=%s",
-            request_id,
-            editing,
-        )
-
-        deadline = (
-            asyncio.get_running_loop().time()
-            + AI_HORDE_TIMEOUT_SECONDS
-        )
+        logger.info("AI-Horde-Auftrag gestartet: %s; Bearbeitung=%s", request_id, editing)
+        deadline = asyncio.get_running_loop().time() + AI_HORDE_TIMEOUT_SECONDS
 
         while asyncio.get_running_loop().time() < deadline:
             await asyncio.sleep(5)
-
-            status = await asyncio.to_thread(
-                horde_check_sync, request_id
-            )
+            status = await asyncio.to_thread(horde_check_sync, request_id)
 
             if status.get("faulted"):
-                raise RuntimeError(
-                    "AI Horde konnte den Bildauftrag nicht ausführen."
-                )
+                raise RuntimeError("AI Horde konnte den Bildauftrag nicht ausführen.")
 
             if status.get("done"):
                 break
         else:
-            raise TimeoutError(
-                "AI Horde hat innerhalb der erlaubten Wartezeit "
-                "kein fertiges Bild geliefert."
-            )
+            raise TimeoutError("AI Horde hat innerhalb der erlaubten Wartezeit kein fertiges Bild geliefert.")
 
-        result_data = await asyncio.to_thread(
-            horde_status_sync, request_id
-        )
+        result_data = await asyncio.to_thread(horde_status_sync, request_id)
         generations = result_data.get("generations") or []
 
         if not generations:
-            raise RuntimeError(
-                "AI Horde meldet den Auftrag als fertig, "
-                "hat aber kein Bild zurückgegeben."
-            )
+            raise RuntimeError("AI Horde meldet den Auftrag als fertig, hat aber kein Bild zurückgegeben.")
 
         image_url = generations[0].get("img")
-
         if not image_url:
-            raise RuntimeError(
-                "AI Horde hat keine Bildadresse zurückgegeben."
-            )
+            raise RuntimeError("AI Horde hat keine Bildadresse zurückgegeben.")
 
-        image_bytes, content_type = await asyncio.to_thread(
-            horde_download_sync, image_url
-        )
-
+        image_bytes, content_type = await asyncio.to_thread(horde_download_sync, image_url)
         suffix = ".webp" if "webp" in content_type else ".png"
 
-        with tempfile.NamedTemporaryFile(
-            suffix=suffix, delete=False
-        ) as tmp:
+        with tempfile.NamedTemporaryFile(suffix=suffix, delete=False) as tmp:
             tmp.write(image_bytes)
             result_path = tmp.name
 
         try:
-            caption_prefix = (
-                "✅ Bearbeitetes Bild"
-                if editing
-                else "✅ Dein neues Bild"
-            )
+            caption_prefix = "✅ Bearbeitetes Bild" if editing else "✅ Dein neues Bild"
             caption = f"{caption_prefix}\n\n{prompt[:850]}"
-
             with open(result_path, "rb") as photo:
-                await message.reply_photo(
-                    photo=photo,
-                    caption=caption,
-                )
+                await message.reply_photo(photo=photo, caption=caption)
         finally:
             try:
                 os.remove(result_path)
             except OSError:
                 pass
 
-        logger.info(
-            "AI-Horde-Bild erfolgreich gesendet. Auftrag=%s",
-            request_id,
-        )
+        logger.info("AI-Horde-Bild erfolgreich gesendet. Auftrag=%s", request_id)
 
     except Exception as exc:
-        logger.exception(
-            "AI-Horde-Bilderstellung/Bearbeitung fehlgeschlagen."
-        )
+        logger.exception("AI-Horde-Bilderstellung/Bearbeitung fehlgeschlagen.")
 
         if isinstance(exc, TimeoutError):
-            error_message = (
-                "⏳ AI Horde hat zu lange gebraucht. "
-                "Bitte versuche es später erneut."
-            )
+            error_message = "⏳ AI Horde hat zu lange gebraucht. Bitte versuche es später erneut."
         elif isinstance(exc, requests.HTTPError):
-            status_code = (
-                exc.response.status_code
-                if exc.response is not None
-                else None
-            )
+            status_code = exc.response.status_code if exc.response is not None else None
 
             if status_code == 401:
-                error_message = (
-                    "⚠️ AI Horde hat den API-Schlüssel abgelehnt. "
-                    "Bitte prüfe AI_HORDE_API_KEY in Render."
-                )
+                error_message = "⚠️ AI Horde hat den API-Schlüssel abgelehnt. Bitte prüfe AI_HORDE_API_KEY in Render."
             elif status_code == 429:
-                error_message = (
-                    "⚠️ AI Horde ist momentan stark ausgelastet "
-                    "oder es gibt zu viele Anfragen. "
-                    "Bitte versuche es später erneut."
-                )
+                error_message = "⚠️ AI Horde ist momentan stark ausgelastet oder es gibt zu viele Anfragen. Bitte versuche es später erneut."
             else:
-                error_message = (
-                    f"⚠️ AI Horde meldet HTTP {status_code}. "
-                    "Bitte prüfe die Render Runtime Logs."
-                )
+                error_message = f"⚠️ AI Horde meldet HTTP {status_code}. Bitte prüfe die Render Runtime Logs."
         elif "Pillow" in str(exc):
-            error_message = (
-                "⚠️ Für die Bearbeitung fehlt Pillow. "
-                "Füge 'Pillow' zu requirements.txt hinzu "
-                "und starte Render neu."
-            )
+            error_message = "⚠️ Für die Bearbeitung fehlt Pillow. Füge 'Pillow' zu requirements.txt hinzu und starte Render neu."
         else:
             error_message = (
-                "⚠️ Das Bild konnte gerade nicht erstellt "
-                "oder bearbeitet werden. Bitte versuche es "
-                "später erneut. Weitere Details stehen "
-                "in den Render Runtime Logs."
+                "⚠️ Das Bild konnte gerade nicht erstellt oder bearbeitet werden. "
+                "Bitte versuche es später erneut. Weitere Details stehen in den Render Runtime Logs."
             )
 
         await message.reply_text(error_message)
@@ -1041,8 +991,9 @@ async def generate_horde_image(
 # ============================================================
 
 async def start_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    name = get_display_name(update)
     await update.effective_message.reply_text(
-        "Hallo! Ich bin NEXUS, dein KI-Assistent. 🤖😊\n\n"
+        f"Hallo {name}! Ich bin NEXUS, dein KI-Assistent. 🤖😊\n\n"
         "Du kannst mir einfach schreiben, was du möchtest.\n"
         "Ich kann auch Bilder erstellen und hochgeladene Bilder bearbeiten.\n\n"
         "Beispiele:\n"
@@ -1050,27 +1001,38 @@ async def start_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
         "• Schreibe „Hallo“ in eleganter Schrift auf dieses Bild.\n"
         "• Verwandle dieses Bild in eine Fantasy-Version.\n\n"
         "Befehle:\n"
-        "/merken Text – etwas speichern\n"
-        "/gedaechtnis – Erinnerungen ansehen\n"
-        "/vergiss Text – Erinnerung löschen\n"
-        "/reset – Chat-Verlauf zurücksetzen\n"
+        "/merken Text – etwas persönlich speichern\n"
+        "/gedaechtnis – deine Erinnerungen ansehen\n"
+        "/vergiss Text – eine Erinnerung löschen\n"
+        "/reset – deinen Chat-Verlauf zurücksetzen\n"
         "/bild Beschreibung – neues Bild erstellen"
     )
 
 
 async def reset_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    chat_id = str(update.effective_chat.id)
-    chat_history.pop(chat_id, None)
+    chat = update.effective_chat
+    user = update.effective_user
+
+    if not chat or not user:
+        return
+
+    history_key = f"{chat.id}:{user.id}"
+    chat_history.pop(history_key, None)
+    clear_user_history(chat.id, user.id)
 
     await update.effective_message.reply_text(
-        "Der kurze Chat-Verlauf wurde zurückgesetzt. 🧹\n"
-        "Gespeicherte Erinnerungen bleiben erhalten."
+        "Dein persönlicher Chat-Verlauf wurde zurückgesetzt. 🧹\n"
+        "Deine gespeicherten Erinnerungen bleiben erhalten."
     )
 
 
 async def remember_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    chat_id = update.effective_chat.id
+    chat = update.effective_chat
+    user = update.effective_user
     value = " ".join(context.args).strip()
+
+    if not chat or not user:
+        return
 
     if not value:
         await update.effective_message.reply_text(
@@ -1087,51 +1049,58 @@ async def remember_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
             key = possible_key.strip()
             value = possible_value.strip()
 
-    if save_memory(chat_id, key, value):
+    if save_memory(chat.id, user.id, key, value):
         await update.effective_message.reply_text(
-            f"Gespeichert! 🧠\n{key}: {value}"
+            f"Persönlich gespeichert! 🧠\n{key}: {value}"
         )
     else:
         await update.effective_message.reply_text(
-            "Ich konnte das leider nicht speichern. "
-            "Prüfe den Datenbankpfad in Render."
+            "Ich konnte das leider nicht speichern. Prüfe den Datenbankpfad in Render."
         )
 
 
 async def memories_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    memories = get_memories(update.effective_chat.id)
+    chat = update.effective_chat
+    user = update.effective_user
+
+    if not chat or not user:
+        return
+
+    memories = get_memories(chat.id, user.id)
 
     if not memories:
         await update.effective_message.reply_text(
-            "Ich habe hier noch keine gespeicherten Erinnerungen. 🧠"
+            "Für dich habe ich hier noch keine persönlichen Erinnerungen gespeichert. 🧠"
         )
         return
 
-    text = "🧠 Das habe ich gespeichert:\n" + "\n".join(
+    text = "🧠 Deine persönlichen Erinnerungen:\n" + "\n".join(
         f"• {key}: {value}" for key, value in memories
     )
     await send_long_text(update.effective_message, text)
 
 
 async def forget_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    chat = update.effective_chat
+    user = update.effective_user
     key = " ".join(context.args).strip()
+
+    if not chat or not user:
+        return
 
     if not key:
         await update.effective_message.reply_text(
-            "Schreib bitte dazu, was ich vergessen soll.\n"
-            "Beispiel: /vergiss Hobby"
+            "Schreib bitte dazu, was ich vergessen soll.\nBeispiel: /vergiss Hobby"
         )
         return
 
-    count = forget_memory(update.effective_chat.id, key)
+    count = forget_memory(chat.id, user.id, key)
 
     if count:
-        await update.effective_message.reply_text(
-            "Erinnerung gelöscht. 🧹"
-        )
+        await update.effective_message.reply_text("Deine Erinnerung wurde gelöscht. 🧹")
     else:
         await update.effective_message.reply_text(
-            "Ich habe dazu keine passende Erinnerung gefunden."
+            "Ich habe dazu keine passende persönliche Erinnerung gefunden."
         )
 
 
@@ -1170,10 +1139,7 @@ async def transcribe_voice(file_path):
     def transcribe():
         with open(file_path, "rb") as audio_file:
             return groq_client.audio.transcriptions.create(
-                file=(
-                    os.path.basename(file_path),
-                    audio_file.read(),
-                ),
+                file=(os.path.basename(file_path), audio_file.read()),
                 model=WHISPER_MODEL,
                 response_format="text",
                 language="de",
@@ -1192,23 +1158,10 @@ def clean_markdown_for_speech(text):
         return ""
 
     text = text.replace("\r\n", "\n").replace("\r", "\n")
-    text = re.sub(
-        r"```[a-zA-Z0-9_+-]*[ \t]*\n?(.*?)```",
-        r"\1",
-        text,
-        flags=re.S,
-    )
+    text = re.sub(r"```[a-zA-Z0-9_+-]*[ \t]*\n?(.*?)```", r"\1", text, flags=re.S)
     text = re.sub(r"`([^`]+)`", r"\1", text)
-    text = re.sub(
-        r"(?m)^[ \t]{0,3}#{1,6}[ \t]*",
-        "",
-        text,
-    )
-    text = re.sub(
-        r"(?m)^[ \t]*(?:---+|___+|\*\*\*+)[ \t]*$",
-        "",
-        text,
-    )
+    text = re.sub(r"(?m)^[ \t]{0,3}#{1,6}[ \t]*", "", text)
+    text = re.sub(r"(?m)^[ \t]*(?:---+|___+|\*\*\*+)[ \t]*$", "", text)
     text = re.sub(r"\*\*(.*?)\*\*", r"\1", text, flags=re.S)
     text = re.sub(r"__(.*?)__", r"\1", text, flags=re.S)
     text = re.sub(r"(?<!\*)\*([^*\n]+)\*(?!\*)", r"\1", text)
@@ -1218,7 +1171,6 @@ def clean_markdown_for_speech(text):
     text = text.replace("**", "").replace("*", "").replace("`", "")
     text = re.sub(r"[ \t]+", " ", text)
     text = re.sub(r"\n{3,}", "\n\n", text)
-
     return text.strip()
 
 
@@ -1227,10 +1179,7 @@ async def make_voice_file(text, path):
         import edge_tts
 
         speech_text = clean_markdown_for_speech(text)
-        communicate = edge_tts.Communicate(
-            speech_text[:3000],
-            EDGE_TTS_VOICE,
-        )
+        communicate = edge_tts.Communicate(speech_text[:3000], EDGE_TTS_VOICE)
         await communicate.save(path)
         return True
 
@@ -1241,9 +1190,7 @@ async def make_voice_file(text, path):
 
 async def send_reply_in_preferred_format(message, text, voice_reply=False):
     if voice_reply:
-        with tempfile.NamedTemporaryFile(
-            suffix=".mp3", delete=False
-        ) as tmp:
+        with tempfile.NamedTemporaryFile(suffix=".mp3", delete=False) as tmp:
             voice_path = tmp.name
 
         try:
@@ -1275,9 +1222,7 @@ def is_addressed(text, bot_username=""):
     if username and f"@{username}" in low:
         return True
 
-    return bool(
-        re.search(r"\b(nexus|ki-assistent|ki assistent|bot)\b", low)
-    )
+    return bool(re.search(r"\b(nexus|ki-assistent|ki assistent|bot)\b", low))
 
 
 def is_stop_phrase(text):
@@ -1292,7 +1237,6 @@ def is_stop_phrase(text):
         "auf wiedersehen nexus", "geh offline", "sei still nexus",
         "nexus schlaf", "nexus sei still",
     )
-
     return any(phrase in low for phrase in stop_phrases)
 
 
@@ -1312,16 +1256,22 @@ def is_farewell_phrase(text):
         "bis morgen", "bis zum nächsten mal",
         "bis zum naechsten mal", "ich verabschiede mich",
     )
-
     return any(phrase in low for phrase in farewell_phrases)
 
 
 def group_should_respond(chat_id, text, bot_username=""):
     now = asyncio.get_running_loop().time()
 
-    if is_stop_phrase(text) or is_farewell_phrase(text):
+    if is_stop_phrase(text):
         group_active_until.pop(chat_id, None)
         return False
+
+    # Verabschiedungen werden in handle_text separat verarbeitet.
+    if is_farewell_phrase(text):
+        return (
+            is_addressed(text, bot_username)
+            or now < group_active_until.get(chat_id, 0)
+        )
 
     addressed = is_addressed(text, bot_username)
     active_until = group_active_until.get(chat_id, 0)
@@ -1334,6 +1284,17 @@ def group_should_respond(chat_id, text, bot_username=""):
     return False
 
 
+def greeting_prefix(chat_id, user_id, display_name):
+    """Erzeugt nur dann eine Begrüßung, wenn sie fällig ist."""
+    if should_greet_user(chat_id, user_id):
+        return f"Hallo {display_name}! 👋 Schön, dass du da bist.\n\n"
+    return ""
+
+
+def farewell_reply(display_name):
+    return f"Mach's gut, {display_name}! 😊 Bis zum nächsten Mal."
+
+
 # ============================================================
 # TEXTNACHRICHTEN VERARBEITEN
 # ============================================================
@@ -1341,12 +1302,14 @@ def group_should_respond(chat_id, text, bot_username=""):
 async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
     message = update.effective_message
     chat = update.effective_chat
+    user = update.effective_user
 
-    if not message or not chat or not message.text:
+    if not message or not chat or not message.text or not user:
         return
 
     text = message.text.strip()
     group = is_group(chat.type)
+    display_name = get_display_name(update)
     replied_photo = None
 
     if message.reply_to_message and message.reply_to_message.photo:
@@ -1380,29 +1343,42 @@ async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
         if request_type == "edit":
             await message.reply_text(
-                "🖼️ Ich kann das Bild bearbeiten. "
-                "Bitte lade das Bild zusammen mit deiner Anweisung "
-                "hoch oder antworte direkt auf ein Bild mit deiner "
-                "Änderungsbeschreibung."
+                "🖼️ Ich kann das Bild bearbeiten. Bitte lade das Bild "
+                "zusammen mit deiner Anweisung hoch oder antworte direkt "
+                "auf ein Bild mit deiner Änderungsbeschreibung."
             )
             return
 
-    if group and not group_should_respond(
-        chat.id, text, context.bot.username or ""
-    ):
+    # In Gruppen antwortet NEXUS nur, wenn er angesprochen wurde
+    # oder die Unterhaltung mit ihm noch aktiv ist.
+    if group and not group_should_respond(chat.id, text, context.bot.username or ""):
         return
 
-    learned = learn_from_text(chat.id, text)
+    if is_farewell_phrase(text):
+        answer = farewell_reply(display_name)
+        update_user_session(chat.id, user.id, display_name)
+        group_active_until.pop(chat.id, None)
+        await message.reply_text(answer)
+        return
+
+    learned = learn_from_text(chat.id, user.id, text)
 
     if learned:
-        await message.reply_text(learned)
+        prefix = greeting_prefix(chat.id, user.id, display_name)
+        update_user_session(chat.id, user.id, display_name)
+        await message.reply_text(prefix + learned)
         return
 
     await message.chat.send_action("typing")
-    reply = await asyncio.to_thread(get_ai_reply, chat.id, text)
+    reply = await asyncio.to_thread(get_ai_reply, chat.id, user.id, text)
+
+    prefix = greeting_prefix(chat.id, user.id, display_name)
+    update_user_session(chat.id, user.id, display_name)
 
     await send_reply_in_preferred_format(
-        message, reply, voice_reply=False
+        message,
+        prefix + reply,
+        voice_reply=False,
     )
 
 
@@ -1413,17 +1389,18 @@ async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
 async def handle_voice(update: Update, context: ContextTypes.DEFAULT_TYPE):
     message = update.effective_message
     chat = update.effective_chat
+    user = update.effective_user
 
-    if not message or not chat or not message.voice:
+    if not message or not chat or not message.voice or not user:
         return
 
     group = is_group(chat.type)
+    display_name = get_display_name(update)
 
     if not groq_client:
         if not group:
             await message.reply_text(
-                "Meine Spracherkennung ist noch nicht verbunden. "
-                "Bitte prüfe GROQ_API_KEY."
+                "Meine Spracherkennung ist noch nicht verbunden. Bitte prüfe GROQ_API_KEY."
             )
         return
 
@@ -1435,9 +1412,7 @@ async def handle_voice(update: Update, context: ContextTypes.DEFAULT_TYPE):
     try:
         tg_file = await context.bot.get_file(message.voice.file_id)
 
-        with tempfile.NamedTemporaryFile(
-            suffix=".ogg", delete=False
-        ) as tmp:
+        with tempfile.NamedTemporaryFile(suffix=".ogg", delete=False) as tmp:
             file_path = tmp.name
 
         await tg_file.download_to_drive(file_path)
@@ -1445,10 +1420,7 @@ async def handle_voice(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
         if not spoken_text:
             if not group:
-                await message.reply_text(
-                    "Ich konnte die Sprachnachricht leider "
-                    "nicht verstehen."
-                )
+                await message.reply_text("Ich konnte die Sprachnachricht leider nicht verstehen.")
             return
 
         image_request = extract_image_request(spoken_text)
@@ -1467,8 +1439,7 @@ async def handle_voice(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
             if request_type == "edit":
                 await message.reply_text(
-                    "🖼️ Bitte lade das Bild hoch und schreibe "
-                    "deine Änderungswünsche dazu."
+                    "🖼️ Bitte lade das Bild hoch und schreibe deine Änderungswünsche dazu."
                 )
                 return
 
@@ -1477,29 +1448,43 @@ async def handle_voice(update: Update, context: ContextTypes.DEFAULT_TYPE):
         ):
             return
 
-        learned = learn_from_text(chat.id, spoken_text)
+        if is_farewell_phrase(spoken_text):
+            update_user_session(chat.id, user.id, display_name)
+            group_active_until.pop(chat.id, None)
+            await send_reply_in_preferred_format(
+                message,
+                farewell_reply(display_name),
+                voice_reply=True,
+            )
+            return
+
+        learned = learn_from_text(chat.id, user.id, spoken_text)
 
         if learned:
-            await message.reply_text(learned)
+            prefix = greeting_prefix(chat.id, user.id, display_name)
+            update_user_session(chat.id, user.id, display_name)
+            await send_reply_in_preferred_format(
+                message, prefix + learned, voice_reply=True
+            )
             return
 
         reply = await asyncio.to_thread(
-            get_ai_reply, chat.id, spoken_text
+            get_ai_reply, chat.id, user.id, spoken_text
         )
 
+        prefix = greeting_prefix(chat.id, user.id, display_name)
+        update_user_session(chat.id, user.id, display_name)
+
         await send_reply_in_preferred_format(
-            message, reply, voice_reply=True
+            message, prefix + reply, voice_reply=True
         )
 
     except Exception:
-        logger.exception(
-            "Verarbeitung der Sprachnachricht fehlgeschlagen."
-        )
+        logger.exception("Verarbeitung der Sprachnachricht fehlgeschlagen.")
 
         if not group:
             await message.reply_text(
-                "Beim Verarbeiten der Sprachnachricht "
-                "ist ein Fehler passiert."
+                "Beim Verarbeiten der Sprachnachricht ist ein Fehler passiert."
             )
 
     finally:
@@ -1515,52 +1500,31 @@ async def handle_voice(update: Update, context: ContextTypes.DEFAULT_TYPE):
 # ============================================================
 
 def is_retryable_gemini_error(exc):
-    """Erkennt vorübergehende Fehler, bei denen ein neuer Versuch hilft."""
-
     error_text = str(exc).lower()
-
     return any(
         marker in error_text
         for marker in (
-            "503",
-            "unavailable",
-            "high demand",
-            "429",
-            "resource_exhausted",
-            "500",
-            "internal server error",
-            "502",
-            "504",
-            "deadline_exceeded",
-            "timeout",
-            "timed out",
+            "503", "unavailable", "high demand", "429",
+            "resource_exhausted", "500", "internal server error",
+            "502", "504", "deadline_exceeded", "timeout", "timed out",
         )
     )
 
 
 def count_words(text):
-    """Zählt Wörter für die Qualitätskontrolle der Bildbeschreibung."""
     return len(re.findall(r"\b[\w'-]+\b", text or "", flags=re.UNICODE))
 
 
 async def analyze_photo_with_gemini(client, image_prompt, image_part):
-    """
-    Analysiert das Foto mit dem Hauptmodell und wechselt bei Fehlern
-    zum Ersatzmodell. Kurze Antworten werden einmal ergänzt.
-    """
-
     from google.genai import types
 
     models = []
-
     for model in (GEMINI_MODEL, GEMINI_FALLBACK_MODEL):
         if model and model not in models:
             models.append(model)
 
     if not models:
-        raise RuntimeError(
-            "Es wurde kein Gemini-Modell konfiguriert."
-        )
+        raise RuntimeError("Es wurde kein Gemini-Modell konfiguriert.")
 
     last_error = None
 
@@ -1569,9 +1533,7 @@ async def analyze_photo_with_gemini(client, image_prompt, image_part):
             try:
                 logger.info(
                     "Fotoanalyse: Modell=%s, Versuch=%s/%s",
-                    model,
-                    attempt + 1,
-                    GEMINI_MAX_ATTEMPTS_PER_MODEL,
+                    model, attempt + 1, GEMINI_MAX_ATTEMPTS_PER_MODEL,
                 )
 
                 request = asyncio.to_thread(
@@ -1586,10 +1548,8 @@ async def analyze_photo_with_gemini(client, image_prompt, image_part):
                 )
 
                 result = await asyncio.wait_for(
-                    request,
-                    timeout=GEMINI_ATTEMPT_TIMEOUT,
+                    request, timeout=GEMINI_ATTEMPT_TIMEOUT
                 )
-
                 answer = getattr(result, "text", None)
                 answer = answer.strip() if answer else ""
 
@@ -1605,25 +1565,21 @@ async def analyze_photo_with_gemini(client, image_prompt, image_part):
                     and attempt + 1 < GEMINI_MAX_ATTEMPTS_PER_MODEL
                 ):
                     logger.warning(
-                        "Fotoanalyse zu kurz (%s Wörter). "
-                        "Fordere eine ausführlichere Beschreibung an.",
+                        "Fotoanalyse zu kurz (%s Wörter). Fordere eine ausführlichere Beschreibung an.",
                         word_count,
                     )
 
                     expanded_prompt = (
                         image_prompt
-                        + "\n\nWICHTIG: Die Antwort war zu kurz. "
-                        "Erstelle eine neue, vollständige und deutlich "
-                        "ausführlichere Beschreibung. Verwende mehrere "
-                        "Überschriften, mehrere Absätze und 8 bis 12 "
-                        "konkrete Stichpunkte, soweit das Bild genug "
-                        "erkennbare Details enthält. Beschreibe das "
-                        "Hauptmotiv, seine Position, sichtbare Merkmale, "
-                        "Gegenstände, Farben, Formen, Hintergrund, "
-                        "Umgebung, Beleuchtung, Schatten, Perspektive, "
-                        "Bildaufbau und Bildwirkung. Ziel sind ungefähr "
-                        "300 Wörter. Wiederhole nicht nur den ersten "
-                        "Satz. Erfinde keine Details."
+                        + "\n\nWICHTIG: Die Antwort war zu kurz. Erstelle eine "
+                        "vollständige, deutlich ausführlichere Beschreibung. "
+                        "Verwende mehrere Überschriften, Absätze und 8 bis 12 "
+                        "konkrete Stichpunkte, soweit das Bild genug Details "
+                        "enthält. Beschreibe Hauptmotiv, Position, Merkmale, "
+                        "Gegenstände, Farben, Formen, Hintergrund, Umgebung, "
+                        "Beleuchtung, Schatten, Perspektive, Bildaufbau und "
+                        "Bildwirkung. Ziel sind ungefähr 300 Wörter. Erfinde "
+                        "keine Details."
                     )
 
                     expanded_request = asyncio.to_thread(
@@ -1638,33 +1594,21 @@ async def analyze_photo_with_gemini(client, image_prompt, image_part):
                     )
 
                     expanded_result = await asyncio.wait_for(
-                        expanded_request,
-                        timeout=GEMINI_ATTEMPT_TIMEOUT,
+                        expanded_request, timeout=GEMINI_ATTEMPT_TIMEOUT
                     )
-
-                    expanded_answer = getattr(
-                        expanded_result, "text", None
-                    )
+                    expanded_answer = getattr(expanded_result, "text", None)
                     expanded_answer = (
-                        expanded_answer.strip()
-                        if expanded_answer
-                        else ""
+                        expanded_answer.strip() if expanded_answer else ""
                     )
 
-                    if (
-                        expanded_answer
-                        and count_words(expanded_answer) > word_count
-                    ):
+                    if expanded_answer and count_words(expanded_answer) > word_count:
                         answer = expanded_answer
                         word_count = count_words(answer)
 
                 logger.info(
-                    "Fotoanalyse erfolgreich mit Modell %s; "
-                    "Antwortlänge=%s Wörter",
-                    model,
-                    word_count,
+                    "Fotoanalyse erfolgreich mit Modell %s; Antwortlänge=%s Wörter",
+                    model, word_count,
                 )
-
                 return answer
 
             except Exception as exc:
@@ -1672,12 +1616,8 @@ async def analyze_photo_with_gemini(client, image_prompt, image_part):
                 retryable = is_retryable_gemini_error(exc)
 
                 logger.warning(
-                    "Fotoanalysefehler: Modell=%s, Versuch=%s, "
-                    "vorübergehend=%s, Fehler=%s",
-                    model,
-                    attempt + 1,
-                    retryable,
-                    exc,
+                    "Fotoanalysefehler: Modell=%s, Versuch=%s, vorübergehend=%s, Fehler=%s",
+                    model, attempt + 1, retryable, exc,
                 )
 
                 if not retryable:
@@ -1685,25 +1625,19 @@ async def analyze_photo_with_gemini(client, image_prompt, image_part):
 
                 if attempt + 1 < GEMINI_MAX_ATTEMPTS_PER_MODEL:
                     wait_seconds = 2 ** (attempt + 1)
-                    logger.info(
-                        "Wiederhole Gemini-Anfrage nach %s Sekunden.",
-                        wait_seconds,
-                    )
+                    logger.info("Wiederhole Gemini-Anfrage nach %s Sekunden.", wait_seconds)
                     await asyncio.sleep(wait_seconds)
 
         if model_index + 1 < len(models):
             logger.warning(
                 "Wechsle von Gemini-Modell %s zu Ersatzmodell %s",
-                model,
-                models[model_index + 1],
+                model, models[model_index + 1],
             )
 
     if last_error:
         raise last_error
 
-    raise RuntimeError(
-        "Alle konfigurierten Gemini-Modelle sind fehlgeschlagen."
-    )
+    raise RuntimeError("Alle konfigurierten Gemini-Modelle sind fehlgeschlagen.")
 
 
 # ============================================================
@@ -1721,10 +1655,7 @@ async def handle_photo(update: Update, context: ContextTypes.DEFAULT_TYPE):
     group = is_group(chat.type)
 
     image_request = (
-        extract_image_request(
-            original_caption,
-            has_source_image=True,
-        )
+        extract_image_request(original_caption, has_source_image=True)
         if original_caption
         else None
     )
@@ -1742,23 +1673,15 @@ async def handle_photo(update: Update, context: ContextTypes.DEFAULT_TYPE):
             return
 
     if group and not group_should_respond(
-        chat.id,
-        original_caption,
-        context.bot.username or "",
+        chat.id, original_caption, context.bot.username or ""
     ):
         return
 
     if not GEMINI_API_KEY:
-        await message.reply_text(
-            "Für die Fotoanalyse fehlt GEMINI_API_KEY in Render."
-        )
+        await message.reply_text("Für die Fotoanalyse fehlt GEMINI_API_KEY in Render.")
         return
 
-    caption = (
-        original_caption
-        or "Beschreibe dieses Bild ausführlich auf Deutsch."
-    )
-
+    caption = original_caption or "Beschreibe dieses Bild ausführlich auf Deutsch."
     path = None
     client = None
 
@@ -1767,14 +1690,9 @@ async def handle_photo(update: Update, context: ContextTypes.DEFAULT_TYPE):
         from google.genai import types
 
         client = genai.Client(api_key=GEMINI_API_KEY)
+        photo_file = await context.bot.get_file(message.photo[-1].file_id)
 
-        photo_file = await context.bot.get_file(
-            message.photo[-1].file_id
-        )
-
-        with tempfile.NamedTemporaryFile(
-            suffix=".jpg", delete=False
-        ) as tmp:
+        with tempfile.NamedTemporaryFile(suffix=".jpg", delete=False) as tmp:
             path = tmp.name
 
         await photo_file.download_to_drive(path)
@@ -1783,20 +1701,13 @@ async def handle_photo(update: Update, context: ContextTypes.DEFAULT_TYPE):
             image_bytes = image_file.read()
 
         if not image_bytes:
-            raise RuntimeError(
-                "Die heruntergeladene Bilddatei ist leer."
-            )
+            raise RuntimeError("Die heruntergeladene Bilddatei ist leer.")
 
-        image_part = types.Part.from_bytes(
-            data=image_bytes,
-            mime_type="image/jpeg",
-        )
+        image_part = types.Part.from_bytes(data=image_bytes, mime_type="image/jpeg")
 
         logger.info(
             "Fotoanalyse gestartet; Hauptmodell=%s, Ersatzmodell=%s, Chat=%s",
-            GEMINI_MODEL,
-            GEMINI_FALLBACK_MODEL or "(nicht konfiguriert)",
-            chat.id,
+            GEMINI_MODEL, GEMINI_FALLBACK_MODEL or "(nicht konfiguriert)", chat.id,
         )
 
         photo_prompt = f"""
@@ -1820,33 +1731,26 @@ GLIEDERUNG:
 
 2. **Gesamteindruck**
    Beschreibe in 3 bis 5 vollständigen Sätzen, was hauptsächlich zu sehen ist.
-   Erkläre, wie die sichtbaren Elemente zusammenwirken.
 
 3. **Wichtige Bilddetails**
-   Nenne 8 bis 12 konkrete Stichpunkte, sofern ausreichend Details erkennbar
-   sind. Berücksichtige Personen oder Tiere, sichtbare Merkmale, Kleidung,
-   Körperhaltung, Gegenstände, Symbole, lesbare Texte, Farben, Formen,
-   Materialien, Oberflächen und Positionen im Bild.
+   Nenne 8 bis 12 konkrete Stichpunkte, sofern ausreichend Details erkennbar sind.
+   Berücksichtige Personen oder Tiere, sichtbare Merkmale, Kleidung, Körperhaltung,
+   Gegenstände, Symbole, lesbare Texte, Farben, Formen, Materialien und Positionen.
 
 4. **Umgebung und Hintergrund**
-   Beschreibe den Hintergrund sowie erkennbare Details im Vorder- und
-   Hintergrund. Erkläre die Anordnung der sichtbaren Elemente.
+   Beschreibe Hintergrund sowie erkennbare Details im Vorder- und Hintergrund.
 
 5. **Licht, Farben und Perspektive**
-   Beschreibe Beleuchtung, Schatten, Farbwirkung, Perspektive und Bildaufbau,
-   soweit diese Merkmale sichtbar sind.
+   Beschreibe Beleuchtung, Schatten, Farbwirkung, Perspektive und Bildaufbau.
 
 6. **Stimmung und Bildwirkung**
-   Erkläre den möglichen Eindruck des Bildes. Trenne Eindrücke klar von
-   objektiv erkennbaren Tatsachen.
+   Erkläre den möglichen Eindruck. Trenne Eindrücke von erkennbaren Tatsachen.
 
 7. **Besonderheiten**
    Erwähne zusätzliche Details, die leicht übersehen werden könnten.
 
 8. **Bei Spiel- oder Programm-Screenshots**
-   Erkläre sichtbare Figuren, Symbole, Statusanzeigen, Menüs, Texte und
-   erkennbare Ziele. Nenne einen sinnvollen nächsten Schritt, wenn genügend
-   Informationen vorhanden sind.
+   Erkläre sichtbare Figuren, Symbole, Statusanzeigen, Menüs, Texte und Ziele.
 
 WICHTIGE REGELN:
 - Schreibe mehrere Absätze und nicht nur einen Satz.
@@ -1856,120 +1760,49 @@ WICHTIGE REGELN:
 - Nutze Emojis sparsam und passend.
 - Erfinde keine Namen, Orte, Ursachen oder Beziehungen.
 - Behaupte nicht, eine Person identifiziert zu haben.
-- Wenn ein Detail unklar ist, sage ausdrücklich, dass es nicht eindeutig
-  erkennbar ist.
+- Wenn ein Detail unklar ist, sage ausdrücklich, dass es nicht eindeutig erkennbar ist.
 - Beantworte konkrete Fragen des Nutzers direkt.
-- Liefere nur die fertige Bildbeschreibung, keine Erklärung deiner
-  Vorgehensweise.
-
-Die Antwort soll ausführlich, strukturiert und vollständig sein.
+- Liefere nur die fertige Bildbeschreibung, keine Erklärung deiner Vorgehensweise.
 """
 
         answer = await asyncio.wait_for(
-            analyze_photo_with_gemini(
-                client,
-                photo_prompt,
-                image_part,
-            ),
+            analyze_photo_with_gemini(client, photo_prompt, image_part),
             timeout=GEMINI_ANALYSIS_TIMEOUT,
         )
 
         if not answer:
-            answer = (
-                "⚠️ Ich konnte das Bild nicht zuverlässig "
-                "beschreiben. Bitte versuche es erneut."
-            )
+            answer = "⚠️ Ich konnte das Bild nicht zuverlässig beschreiben. Bitte versuche es erneut."
 
         await send_long_text(message, answer)
 
         logger.info(
             "Fotoanalyse erfolgreich abgeschlossen; Chat=%s; Wörter=%s",
-            chat.id,
-            count_words(answer),
+            chat.id, count_words(answer),
         )
 
     except Exception as exc:
         logger.exception("Fotoanalyse fehlgeschlagen.")
         error_text = str(exc).lower()
 
-        if (
-            "api key" in error_text
-            or "api_key" in error_text
-            or "unauthorized" in error_text
-        ):
-            user_message = (
-                "Die Gemini-Anmeldung ist fehlgeschlagen. "
-                "Bitte prüfe GEMINI_API_KEY in Render."
-            )
-
+        if "api key" in error_text or "api_key" in error_text or "unauthorized" in error_text:
+            user_message = "Die Gemini-Anmeldung ist fehlgeschlagen. Bitte prüfe GEMINI_API_KEY in Render."
         elif "404" in error_text or "not found" in error_text:
-            user_message = (
-                "Das Gemini-Modell wurde nicht gefunden oder ist "
-                "für deinen Schlüssel nicht verfügbar. "
-                "Bitte prüfe GEMINI_MODEL und GEMINI_FALLBACK_MODEL "
-                "in Render."
-            )
-
-        elif (
-            "403" in error_text
-            or "permission" in error_text
-            or "forbidden" in error_text
-        ):
-            user_message = (
-                "Gemini hat den Zugriff verweigert. "
-                "Bitte prüfe die API-Berechtigungen und den Projektzugriff."
-            )
-
-        elif (
-            "429" in error_text
-            or "quota" in error_text
-            or "rate limit" in error_text
-            or "resource_exhausted" in error_text
-        ):
-            user_message = (
-                "⚠️ Das Gemini-Limit oder die Anfragengrenze wurde "
-                "erreicht. Bitte warte etwas und versuche es erneut. "
-                "Prüfe auch, ob dein Ersatzmodell verfügbar ist."
-            )
-
-        elif (
-            "503" in error_text
-            or "unavailable" in error_text
-            or "high demand" in error_text
-        ):
-            user_message = (
-                "⚠️ Gemini ist momentan stark ausgelastet. "
-                "NEXUS hat Wiederholungsversuche und das konfigurierte "
-                "Ersatzmodell ausprobiert, aber die Fotoanalyse ist "
-                "weiterhin fehlgeschlagen. Bitte versuche es später "
-                "erneut oder trage in Render ein anderes verfügbares "
-                "Modell bei GEMINI_FALLBACK_MODEL ein."
-            )
-
-        elif (
-            isinstance(exc, asyncio.TimeoutError)
-            or "timeout" in error_text
-            or "timed out" in error_text
-        ):
-            user_message = (
-                "⏳ Die Fotoanalyse hat zu lange gedauert. "
-                "NEXUS hat das Zeitlimit erreicht. Bitte versuche es "
-                "erneut. Falls das öfter passiert, prüfe die Render Logs "
-                "und die Verfügbarkeit der Gemini-Modelle."
-            )
-
+            user_message = "Das Gemini-Modell wurde nicht gefunden oder ist für deinen Schlüssel nicht verfügbar. Bitte prüfe GEMINI_MODEL und GEMINI_FALLBACK_MODEL in Render."
+        elif "403" in error_text or "permission" in error_text or "forbidden" in error_text:
+            user_message = "Gemini hat den Zugriff verweigert. Bitte prüfe die API-Berechtigungen und den Projektzugriff."
+        elif "429" in error_text or "quota" in error_text or "rate limit" in error_text or "resource_exhausted" in error_text:
+            user_message = "⚠️ Das Gemini-Limit oder die Anfragengrenze wurde erreicht. Bitte warte etwas und versuche es erneut."
+        elif "503" in error_text or "unavailable" in error_text or "high demand" in error_text:
+            user_message = "⚠️ Gemini ist momentan stark ausgelastet. NEXUS hat Wiederholungsversuche und das konfigurierte Ersatzmodell ausprobiert. Bitte versuche es später erneut."
+        elif isinstance(exc, asyncio.TimeoutError) or "timeout" in error_text or "timed out" in error_text:
+            user_message = "⏳ Die Fotoanalyse hat zu lange gedauert. Bitte versuche es erneut."
         else:
-            user_message = (
-                "Die Fotoanalyse ist fehlgeschlagen. "
-                "Weitere Details stehen in den Render Runtime Logs."
-            )
+            user_message = "Die Fotoanalyse ist fehlgeschlagen. Weitere Details stehen in den Render Runtime Logs."
 
         try:
             await message.reply_text(user_message)
         except Exception:
-            logger.exception(
-                "Fehlermeldung zur Fotoanalyse konnte nicht gesendet werden."
-            )
+            logger.exception("Fehlermeldung zur Fotoanalyse konnte nicht gesendet werden.")
 
     finally:
         if path:
@@ -2008,11 +1841,7 @@ async def on_error(update: object, context: ContextTypes.DEFAULT_TYPE):
 # ============================================================
 
 def build_application():
-    application = (
-        Application.builder()
-        .token(TELEGRAM_TOKEN)
-        .build()
-    )
+    application = Application.builder().token(TELEGRAM_TOKEN).build()
 
     application.add_handler(CommandHandler("start", start_command))
     application.add_handler(CommandHandler("reset", reset_command))
@@ -2021,18 +1850,13 @@ def build_application():
     application.add_handler(CommandHandler("vergiss", forget_command))
     application.add_handler(CommandHandler("bild", image_command))
 
-    application.add_handler(
-        MessageHandler(filters.VOICE, handle_voice)
-    )
-    application.add_handler(
-        MessageHandler(filters.PHOTO, handle_photo)
-    )
+    application.add_handler(MessageHandler(filters.VOICE, handle_voice))
+    application.add_handler(MessageHandler(filters.PHOTO, handle_photo))
     application.add_handler(
         MessageHandler(filters.TEXT & ~filters.COMMAND, handle_text)
     )
 
     application.add_error_handler(on_error)
-
     return application
 
 
@@ -2045,9 +1869,7 @@ async def run_bot_async():
     updater = application.updater
 
     if updater is None:
-        raise RuntimeError(
-            "Der Telegram-Updater konnte nicht erstellt werden."
-        )
+        raise RuntimeError("Der Telegram-Updater konnte nicht erstellt werden.")
 
     initialized = False
     started = False
@@ -2055,7 +1877,6 @@ async def run_bot_async():
 
     try:
         logger.info("Initialisiere Telegram-Anwendung …")
-
         await application.initialize()
         initialized = True
 
@@ -2065,10 +1886,7 @@ async def run_bot_async():
         await updater.start_polling(drop_pending_updates=False)
         polling_started = True
 
-        logger.info(
-            "NEXUS Telegram-Bot läuft und empfängt Nachrichten."
-        )
-
+        logger.info("NEXUS Telegram-Bot läuft und empfängt Nachrichten.")
         await asyncio.Event().wait()
 
     finally:
@@ -2078,25 +1896,19 @@ async def run_bot_async():
             try:
                 await updater.stop()
             except Exception:
-                logger.exception(
-                    "Fehler beim Stoppen des Telegram-Updaters."
-                )
+                logger.exception("Fehler beim Stoppen des Telegram-Updaters.")
 
         if started:
             try:
                 await application.stop()
             except Exception:
-                logger.exception(
-                    "Fehler beim Stoppen der Telegram-Anwendung."
-                )
+                logger.exception("Fehler beim Stoppen der Telegram-Anwendung.")
 
         if initialized:
             try:
                 await application.shutdown()
             except Exception:
-                logger.exception(
-                    "Fehler beim Herunterfahren der Telegram-Anwendung."
-                )
+                logger.exception("Fehler beim Herunterfahren der Telegram-Anwendung.")
 
 
 def main():
@@ -2127,25 +1939,20 @@ def start_bot_thread():
             return
 
         if not TELEGRAM_TOKEN:
-            logger.warning(
-                "Telegram-Bot bleibt aus, da TELEGRAM_TOKEN fehlt."
-            )
+            logger.warning("Telegram-Bot bleibt aus, da TELEGRAM_TOKEN fehlt.")
             return
 
         def runner():
             try:
                 main()
             except Exception:
-                logger.exception(
-                    "Telegram-Bot konnte nicht gestartet werden."
-                )
+                logger.exception("Telegram-Bot konnte nicht gestartet werden.")
 
         _bot_thread = threading.Thread(
             target=runner,
             name="nexus-telegram-bot",
             daemon=True,
         )
-
         _bot_thread.start()
         logger.info("Telegram-Bot-Thread wurde gestartet.")
 
