@@ -24,7 +24,7 @@ from telegram.ext import (
 )
 
 # ============================================================
-# NEXUS KI-ASSISTENT — RENDER + TELEGRAM
+# NEXUS KI-ASSISTENT — Render + Telegram
 # ============================================================
 
 logging.basicConfig(
@@ -349,7 +349,8 @@ def markdown_to_telegram_html(text):
 
     text = html.escape(text, quote=False)
 
-    # Wichtig: Nur Leerzeichen und Tabs verwenden, nicht \s*.
+    # Wichtig: Hier nur Leerzeichen und Tabs verwenden, niemals \s*.
+    # \s umfasst auch Zeilenumbrüche und könnte Leerzeilen verschlucken.
     text = re.sub(
         r"(?m)^[ \t]*(?:---+|___+|\*\*\*+)[ \t]*$",
         "",
@@ -386,6 +387,7 @@ def markdown_to_telegram_html(text):
         text,
     )
 
+    # Auch hier keine \s*-Muster: Sie können Leerzeilen entfernen.
     text = re.sub(
         r"(?m)^[ \t]*[-*][ \t]+",
         "• ",
@@ -398,6 +400,7 @@ def markdown_to_telegram_html(text):
             block,
         )
 
+    # Nur äußere Leerzeichen entfernen; innere Leerzeilen bleiben bestehen.
     return text.strip() or "Entschuldigung, ich habe gerade keine Antwort."
 
 
@@ -423,6 +426,7 @@ async def send_long_text(message, text, parse_mode=None):
         if split_at < 1000:
             split_at = max_chunk
 
+        # Trennzeichen am Ende des vorherigen Teils erhalten.
         if remaining[split_at:split_at + 2] == "\n\n":
             split_at += 2
         elif remaining[split_at:split_at + 1] == "\n":
@@ -456,10 +460,7 @@ async def send_long_text(message, text, parse_mode=None):
 
 def get_ai_reply(chat_id, user_text):
     if not groq_client:
-        return (
-            "Meine KI ist noch nicht verbunden. "
-            "Bitte prüfe GROQ_API_KEY in Render."
-        )
+        return "Meine KI ist noch nicht verbunden. Bitte prüfe GROQ_API_KEY in Render."
 
     memories = get_memories(chat_id)
     memory_text = "\n".join(
@@ -565,8 +566,7 @@ async def remember_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
         )
     else:
         await update.effective_message.reply_text(
-            "Ich konnte das leider nicht speichern. "
-            "Prüfe den Datenbankpfad in Render."
+            "Ich konnte das leider nicht speichern. Prüfe den Datenbankpfad in Render."
         )
 
 
@@ -623,8 +623,6 @@ async def image_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
         "Ich versuche, dein Bild zu erstellen. 🎨"
     )
 
-    temp_path = None
-
     try:
         url = (
             "https://image.pollinations.ai/prompt/"
@@ -654,25 +652,83 @@ async def image_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
             tmp.write(response.content)
             temp_path = tmp.name
 
-        with open(temp_path, "rb") as photo:
-            await update.effective_message.reply_photo(
-                photo=photo,
-                caption=prompt[:900],
-            )
-
-    except Exception:
-        logger.exception("Bildgenerierung fehlgeschlagen.")
-        await update.effective_message.reply_text(
-            "Das Bild konnte gerade nicht erstellt werden. "
-            "Bitte versuche es später erneut."
-        )
-
-    finally:
-        if temp_path:
+        try:
+            with open(temp_path, "rb") as photo:
+                await update.effective_message.reply_photo(
+                    photo=photo,
+                    caption=prompt[:900],
+                )
+        finally:
             try:
                 os.remove(temp_path)
             except OSError:
                 pass
+
+    except Exception:
+        logger.exception("Bildgenerierung fehlgeschlagen.")
+        await update.effective_message.reply_text(
+            "Das Bild konnte gerade nicht erstellt werden. Bitte versuche es später erneut."
+        )
+
+
+# ============================================================
+# SPRACHNACHRICHTEN
+# ============================================================
+
+async def transcribe_voice(file_path):
+    if not groq_client:
+        return None
+
+    def transcribe():
+        with open(file_path, "rb") as audio_file:
+            return groq_client.audio.transcriptions.create(
+                file=(os.path.basename(file_path), audio_file.read()),
+                model=WHISPER_MODEL,
+                response_format="text",
+                language="de",
+            )
+
+    transcription = await asyncio.to_thread(transcribe)
+
+    if isinstance(transcription, str):
+        return transcription.strip()
+
+    return getattr(transcription, "text", "").strip()
+
+
+async def make_voice_file(text, path):
+    try:
+        import edge_tts
+
+        communicate = edge_tts.Communicate(text[:3000], EDGE_TTS_VOICE)
+        await communicate.save(path)
+        return True
+
+    except Exception:
+        logger.exception("Sprachausgabe fehlgeschlagen.")
+        return False
+
+
+async def send_reply_in_preferred_format(message, text, voice_reply=False):
+    if voice_reply:
+        with tempfile.NamedTemporaryFile(
+            suffix=".mp3",
+            delete=False,
+        ) as tmp:
+            voice_path = tmp.name
+
+        try:
+            if await make_voice_file(text, voice_path):
+                with open(voice_path, "rb") as audio:
+                    await message.reply_voice(voice=audio)
+                return
+        finally:
+            try:
+                os.remove(voice_path)
+            except OSError:
+                pass
+
+    await send_long_text(message, text)
 
 
 # ============================================================
@@ -696,62 +752,50 @@ def is_addressed(text, bot_username=""):
 
 
 def is_stop_phrase(text):
+    """Erkennt Stoppwörter unabhängig davon, ob Nexus ausdrücklich genannt wird."""
     low = (text or "").lower().strip()
 
-    return any(
-        phrase in low
-        for phrase in (
-            "nexus aus",
-            "nexus stopp",
-            "stopp nexus",
-            "ruhe nexus",
-            "tschüss nexus",
-            "auf wiedersehen nexus",
-            "geh offline",
-            "sei still nexus",
-            "nexus schlaf",
-        )
+    # Einzelne Stoppwörter als ganze Wörter erkennen, damit z. B. "stopp" klappt.
+    if re.search(r"\b(stopp|stop|halt|ruhe)\b", low):
+        return True
+
+    stop_phrases = (
+        "nexus aus",
+        "nexus stopp",
+        "stopp nexus",
+        "stop nexus",
+        "ruhe nexus",
+        "tschüss nexus",
+        "tschues nexus",
+        "auf wiedersehen nexus",
+        "geh offline",
+        "sei still nexus",
+        "nexus schlaf",
+        "nexus sei still",
     )
+    return any(phrase in low for phrase in stop_phrases)
 
 
 def is_farewell_phrase(text):
-    """Erkennt übliche Verabschiedungen, nach denen NEXUS still sein soll."""
+    """Erkennt übliche Abschiede, nach denen NEXUS sofort still sein soll."""
     low = (text or "").lower().strip()
     farewell_phrases = (
-        "tschüss",
-        "tschues",
-        "ciao",
-        "auf wiedersehen",
-        "bis später",
-        "bis spaeter",
-        "bis dann",
-        "bis bald",
-        "gute nacht",
-        "gute nacht zusammen",
-        "mach's gut",
-        "mach’s gut",
-        "macht's gut",
-        "macht’s gut",
-        "ich muss los",
-        "ich bin dann weg",
-        "bin dann weg",
-        "ich gehe jetzt",
-        "ich geh jetzt",
-        "schönen abend",
-        "schoenen abend",
-        "schönes wochenende",
-        "schoenes wochenende",
+        "tschüss", "tschues", "tschüssi", "tschuess", "bye", "goodbye",
+        "good bye", "ciao", "auf wiedersehen", "aufwiedersehen",
+        "bis später", "bis spaeter", "bis dann", "bis bald", "gute nacht",
+        "mach's gut", "mach’s gut", "macht's gut", "macht’s gut",
+        "ich muss los", "ich bin dann weg", "bin dann weg", "ich gehe jetzt",
+        "ich geh jetzt", "schönen abend", "schoenen abend", "schönes wochenende",
+        "schoenes wochenende", "bis morgen", "bis zum nächsten mal",
+        "bis zum naechsten mal", "ich verabschiede mich",
     )
     return any(phrase in low for phrase in farewell_phrases)
 
 
 def group_should_respond(chat_id, text, bot_username=""):
-    """
-    Aktiviert das Gruppengespräch bei direkter Ansprache.
-    Während des Gesprächs verlängert jede Nachricht die Aktivität.
-    Nach 180 Sekunden Inaktivität oder einer Verabschiedung
-    wird NEXUS wieder still.
-    """
+    """Aktiviert das Gruppengespräch bei direkter Ansprache und verlängert es
+    bei jeder Nachricht. Nach 180 Sekunden Inaktivität oder einer Verabschiedung
+    wird NEXUS wieder still."""
     now = asyncio.get_running_loop().time()
 
     if is_stop_phrase(text) or is_farewell_phrase(text):
@@ -805,68 +849,8 @@ async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 
 # ============================================================
-# SPRACHNACHRICHTEN
+# SPRACHNACHRICHTEN VERARBEITEN
 # ============================================================
-
-async def transcribe_voice(file_path):
-    if not groq_client:
-        return None
-
-    def transcribe():
-        with open(file_path, "rb") as audio_file:
-            return groq_client.audio.transcriptions.create(
-                file=(os.path.basename(file_path), audio_file.read()),
-                model=WHISPER_MODEL,
-                response_format="text",
-                language="de",
-            )
-
-    transcription = await asyncio.to_thread(transcribe)
-
-    if isinstance(transcription, str):
-        return transcription.strip()
-
-    return getattr(transcription, "text", "").strip()
-
-
-async def make_voice_file(text, path):
-    try:
-        import edge_tts
-
-        communicate = edge_tts.Communicate(text[:3000], EDGE_TTS_VOICE)
-        await communicate.save(path)
-        return True
-
-    except Exception:
-        logger.exception("Sprachausgabe fehlgeschlagen.")
-        return False
-
-
-async def send_reply_in_preferred_format(message, text, voice_reply=False):
-    if voice_reply:
-        voice_path = None
-
-        try:
-            with tempfile.NamedTemporaryFile(
-                suffix=".mp3",
-                delete=False,
-            ) as tmp:
-                voice_path = tmp.name
-
-            if await make_voice_file(text, voice_path):
-                with open(voice_path, "rb") as audio:
-                    await message.reply_voice(voice=audio)
-                return
-
-        finally:
-            if voice_path:
-                try:
-                    os.remove(voice_path)
-                except OSError:
-                    pass
-
-    await send_long_text(message, text)
-
 
 async def handle_voice(update: Update, context: ContextTypes.DEFAULT_TYPE):
     message = update.effective_message
@@ -878,10 +862,10 @@ async def handle_voice(update: Update, context: ContextTypes.DEFAULT_TYPE):
     group = is_group(chat.type)
 
     if not groq_client:
+        # In Gruppen keine automatische Antwort auf nicht prüfbare Sprachnachrichten.
         if not group:
             await message.reply_text(
-                "Meine Spracherkennung ist noch nicht verbunden. "
-                "Bitte prüfe GROQ_API_KEY in Render."
+                "Meine Spracherkennung ist noch nicht verbunden. Bitte prüfe GROQ_API_KEY."
             )
         return
 
@@ -925,7 +909,6 @@ async def handle_voice(update: Update, context: ContextTypes.DEFAULT_TYPE):
             chat.id,
             spoken_text,
         )
-
         await send_reply_in_preferred_format(
             message,
             reply,
@@ -934,7 +917,6 @@ async def handle_voice(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     except Exception:
         logger.exception("Verarbeitung der Sprachnachricht fehlgeschlagen.")
-
         if not group:
             await message.reply_text(
                 "Beim Verarbeiten der Sprachnachricht ist ein Fehler passiert."
@@ -959,6 +941,12 @@ async def handle_photo(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not message or not chat or not message.photo:
         return
 
+    if not GEMINI_API_KEY:
+        await message.reply_text(
+            "Für die Fotoanalyse fehlt GEMINI_API_KEY in Render."
+        )
+        return
+
     original_caption = message.caption or ""
     caption = (
         original_caption
@@ -968,13 +956,6 @@ async def handle_photo(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if is_group(chat.type) and not group_should_respond(
         chat.id, original_caption, context.bot.username or ""
     ):
-        return
-
-    if not GEMINI_API_KEY:
-        if not is_group(chat.type):
-            await message.reply_text(
-                "Für die Fotoanalyse fehlt GEMINI_API_KEY in Render."
-            )
         return
 
     path = None
@@ -1093,8 +1074,7 @@ FORMAT:
             or "rate limit" in error_text
         ):
             user_message = (
-                "Das Gemini-Limit wurde erreicht. "
-                "Bitte warte etwas und versuche es erneut."
+                "Das Gemini-Limit wurde erreicht. Bitte warte etwas und versuche es erneut."
             )
         else:
             user_message = (
@@ -1102,8 +1082,7 @@ FORMAT:
                 "Die genaue Ursache steht in den Render Runtime Logs."
             )
 
-        if not is_group(chat.type):
-            await message.reply_text(user_message)
+        await message.reply_text(user_message)
 
     finally:
         if path:
@@ -1142,11 +1121,6 @@ async def on_error(update: object, context: ContextTypes.DEFAULT_TYPE):
 # ============================================================
 
 def build_application():
-    if not TELEGRAM_TOKEN:
-        raise RuntimeError(
-            "TELEGRAM_TOKEN fehlt in den Render-Umgebungsvariablen."
-        )
-
     application = Application.builder().token(TELEGRAM_TOKEN).build()
 
     application.add_handler(CommandHandler("start", start_command))
