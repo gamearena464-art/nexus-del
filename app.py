@@ -1,6 +1,7 @@
 import os
 import re
 import html
+import time
 import base64
 import logging
 import asyncio
@@ -174,8 +175,13 @@ Sei jederzeit respektvoll, geduldig und hilfreich.
 chat_history = defaultdict(list)
 group_active_until = {}
 
+# Merkt sich, wann eine Person zuletzt mit NEXUS geschrieben hat,
+# damit nach einer längeren Pause wieder persönlich begrüßt wird.
+user_last_seen = {}
+
 MAX_HISTORY_MESSAGES = 12
 GROUP_ACTIVE_SECONDS = 180
+SESSION_GAP_SECONDS = 1800
 
 
 # ============================================================
@@ -346,6 +352,103 @@ def learn_from_text(chat_id, text):
                 )
 
     return None
+
+
+# ============================================================
+# PERSÖNLICHE ANSPRACHE (TELEGRAM-NAME)
+# ============================================================
+
+GREETING_PATTERN = re.compile(
+    r"\b(?:hallo|hallöchen|hallöle|hi|hey|huhu|moin|servus|"
+    r"grüß\s*dich|grüß\s*gott|gruess\s*gott|guten\s+morgen|"
+    r"guten\s+tag|guten\s+abend|guten\s+mittag|"
+    r"schönen\s+guten\s+morgen)\b",
+    flags=re.IGNORECASE,
+)
+
+
+def get_user_name(user):
+    """Gibt den Telegram-Vornamen zurück (nicht @Nutzername, nicht ID)."""
+
+    if not user:
+        return ""
+
+    name = (getattr(user, "first_name", "") or "").strip()
+
+    # Steuerzeichen, Anführungszeichen und Mehrfach-Leerzeichen entfernen
+    name = re.sub(r"[\x00-\x1f\x7f\"“”„<>]", " ", name)
+    name = re.sub(r"\s+", " ", name).strip()
+
+    return name[:40]
+
+
+def detect_interaction_mode(chat_id, user, text):
+    """
+    Liefert 'greeting', 'farewell' oder 'normal'.
+
+    - farewell: Der Nutzer verabschiedet sich.
+    - greeting: Der Nutzer begrüßt NEXUS oder schreibt nach längerer
+      Pause wieder (neues Gespräch).
+    - normal: laufendes Gespräch, Name wird nicht erwähnt.
+    """
+
+    user_id = getattr(user, "id", None)
+    key = (str(chat_id), str(user_id))
+    now = time.time()
+
+    last_seen = user_last_seen.get(key)
+
+    if is_farewell_phrase(text):
+        user_last_seen.pop(key, None)
+        return "farewell"
+
+    user_last_seen[key] = now
+
+    if GREETING_PATTERN.search(text or ""):
+        return "greeting"
+
+    if last_seen is None or now - last_seen > SESSION_GAP_SECONDS:
+        return "greeting"
+
+    return "normal"
+
+
+def build_name_instruction(user_name, mode):
+    """Erzeugt den Hinweis für die KI, wann der Name genutzt wird."""
+
+    if not user_name:
+        return None
+
+    base = (
+        f"Du sprichst gerade mit {user_name}. "
+        f"Nachrichten im bisherigen Verlauf beginnen mit dem Namen des "
+        f"jeweiligen Absenders und einem Doppelpunkt. Schreibe selbst "
+        f"niemals so ein Namenspräfix am Anfang deiner Antwort. "
+    )
+
+    if mode == "greeting":
+        return base + (
+            f"Das ist der Beginn eines Gesprächs. Begrüße {user_name} "
+            f"kurz und freundlich mit dem Vornamen, zum Beispiel "
+            f"„Hallo {user_name}!“. Wenn die Nachricht nur eine Begrüßung "
+            f"ist, frage danach kurz, was das Anliegen ist. Wenn die "
+            f"Nachricht schon eine Frage oder ein Anliegen enthält, "
+            f"begrüße kurz und beantworte es dann direkt."
+        )
+
+    if mode == "farewell":
+        return base + (
+            f"{user_name} verabschiedet sich. Verabschiede dich kurz und "
+            f"herzlich mit dem Vornamen, zum Beispiel „Okay {user_name}, "
+            f"ich wünsche dir noch einen schönen Tag!“ oder passend zur "
+            f"Tageszeit. Halte die Antwort kurz."
+        )
+
+    return base + (
+        f"Dies ist ein laufendes Gespräch. Verwende den Namen "
+        f"{user_name} in deiner Antwort NICHT, sondern antworte "
+        f"direkt auf die Nachricht."
+    )
 
 
 # ============================================================
@@ -523,7 +626,7 @@ async def send_long_text(message, text, parse_mode=None):
 # KI-ANTWORTEN
 # ============================================================
 
-def get_ai_reply(chat_id, user_text):
+def get_ai_reply(chat_id, user_text, user_name="", mode="normal"):
     if not groq_client:
         return (
             "Meine KI ist noch nicht verbunden. "
@@ -548,10 +651,22 @@ def get_ai_reply(chat_id, user_text):
             ),
         })
 
+    name_instruction = build_name_instruction(user_name, mode)
+
+    if name_instruction:
+        messages.append({
+            "role": "system",
+            "content": name_instruction,
+        })
+
+    labeled_text = (
+        f"{user_name}: {user_text}" if user_name else user_text
+    )
+
     messages.extend(
         chat_history[str(chat_id)][-MAX_HISTORY_MESSAGES:]
     )
-    messages.append({"role": "user", "content": user_text})
+    messages.append({"role": "user", "content": labeled_text})
 
     try:
         result = groq_client.chat.completions.create(
@@ -568,12 +683,12 @@ def get_ai_reply(chat_id, user_text):
 
         history = chat_history[str(chat_id)]
         history.extend([
-            {"role": "user", "content": user_text[:3000]},
+            {"role": "user", "content": labeled_text[:3000]},
             {"role": "assistant", "content": answer[:3000]},
         ])
         chat_history[str(chat_id)] = history[-MAX_HISTORY_MESSAGES:]
 
-        log_message(chat_id, "user", user_text)
+        log_message(chat_id, "user", labeled_text)
         log_message(chat_id, "assistant", answer)
 
         return answer
@@ -1332,14 +1447,23 @@ def is_farewell_phrase(text):
 def group_should_respond(chat_id, text, bot_username=""):
     now = asyncio.get_running_loop().time()
 
-    if is_stop_phrase(text) or is_farewell_phrase(text):
+    addressed = is_addressed(text, bot_username)
+    active_until = group_active_until.get(chat_id, 0)
+    was_active = addressed or now < active_until
+
+    # Verabschiedung: NEXUS verabschiedet sich noch einmal persönlich,
+    # wenn er gerade im Gespräch war, und geht danach wieder in den
+    # Ruhemodus.
+    if is_farewell_phrase(text):
+        group_active_until.pop(chat_id, None)
+        return was_active
+
+    # Stopp-Befehle bleiben stumm.
+    if is_stop_phrase(text):
         group_active_until.pop(chat_id, None)
         return False
 
-    addressed = is_addressed(text, bot_username)
-    active_until = group_active_until.get(chat_id, 0)
-
-    if addressed or now < active_until:
+    if was_active:
         group_active_until[chat_id] = now + GROUP_ACTIVE_SECONDS
         return True
 
@@ -1411,8 +1535,14 @@ async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await message.reply_text(learned)
         return
 
+    user = update.effective_user
+    user_name = get_user_name(user)
+    mode = detect_interaction_mode(chat.id, user, text)
+
     await message.chat.send_action("typing")
-    reply = await asyncio.to_thread(get_ai_reply, chat.id, text)
+    reply = await asyncio.to_thread(
+        get_ai_reply, chat.id, text, user_name, mode
+    )
 
     await send_reply_in_preferred_format(
         message, reply, voice_reply=False
@@ -1496,8 +1626,12 @@ async def handle_voice(update: Update, context: ContextTypes.DEFAULT_TYPE):
             await message.reply_text(learned)
             return
 
+        user = update.effective_user
+        user_name = get_user_name(user)
+        mode = detect_interaction_mode(chat.id, user, spoken_text)
+
         reply = await asyncio.to_thread(
-            get_ai_reply, chat.id, spoken_text
+            get_ai_reply, chat.id, spoken_text, user_name, mode
         )
 
         await send_reply_in_preferred_format(
